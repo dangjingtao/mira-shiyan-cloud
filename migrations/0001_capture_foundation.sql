@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS capture_tasks (
   title TEXT NOT NULL,
   scene_id TEXT NOT NULL,
   lifecycle_status TEXT NOT NULL DEFAULT 'active'
-    CHECK (lifecycle_status IN ('active', 'completed', 'archived', 'cancelled')),
+    CHECK (lifecycle_status IN ('active', 'ready', 'completed', 'cancelled')),
+  current_stage TEXT NOT NULL DEFAULT 'upload',
   create_idempotency_key TEXT NOT NULL,
   correlation_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -30,12 +31,13 @@ CREATE TABLE IF NOT EXISTS capture_stages (
   task_id TEXT NOT NULL,
   stage TEXT NOT NULL,
   status TEXT NOT NULL
-    CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'blocked')),
-  attempt INTEGER NOT NULL DEFAULT 0,
+    CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'skipped')),
+  retryable INTEGER NOT NULL DEFAULT 0 CHECK (retryable IN (0, 1)),
+  retry_count INTEGER NOT NULL DEFAULT 0,
   error_code TEXT,
   error_message TEXT,
   started_at TEXT,
-  completed_at TEXT,
+  finished_at TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (task_id, stage),
   FOREIGN KEY (task_id) REFERENCES capture_tasks(id) ON DELETE CASCADE
