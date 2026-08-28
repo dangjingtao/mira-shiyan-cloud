@@ -1,0 +1,519 @@
+import { WorkflowEntrypoint } from 'cloudflare:workers';
+import { createPresignedR2PutUrl } from '../shared/r2Presign';
+import type {
+  ApiEnvelope,
+  CaptureStageView,
+  CaptureTaskView,
+  CreateCaptureTaskInput,
+  UploadGrant,
+} from '../shared/contracts';
+
+type D1Value = string | number | null;
+
+interface D1Result<T = unknown> {
+  results?: T[];
+  success: boolean;
+}
+
+interface D1Statement {
+  bind(...values: D1Value[]): D1Statement;
+  first<T = Record<string, unknown>>(): Promise<T | null>;
+  run<T = unknown>(): Promise<D1Result<T>>;
+  all<T = Record<string, unknown>>(): Promise<D1Result<T>>;
+}
+
+interface D1DatabaseLike {
+  prepare(sql: string): D1Statement;
+  batch(statements: D1Statement[]): Promise<D1Result[]>;
+}
+
+interface R2ObjectLike {
+  size: number;
+  etag: string;
+  httpMetadata?: { contentType?: string };
+}
+
+interface R2BucketLike {
+  head(key: string): Promise<R2ObjectLike | null>;
+}
+
+interface WorkflowBindingLike {
+  create(input?: { id?: string; params?: Record<string, unknown> }): Promise<unknown>;
+}
+
+interface Env {
+  DB: D1DatabaseLike;
+  AUDIO: R2BucketLike;
+  CAPTURE_WORKFLOW: WorkflowBindingLike;
+  SHIYAN_LLM: unknown;
+  R2_ACCOUNT_ID: string;
+  R2_ACCESS_KEY_ID: string;
+  R2_SECRET_ACCESS_KEY: string;
+  R2_BUCKET_NAME: string;
+  UPLOAD_TTL_SECONDS: string;
+  DEVICE_AUTH_PEPPER: string;
+}
+
+interface DeviceRow {
+  id: string;
+  user_id: string | null;
+}
+
+interface TaskRow {
+  id: string;
+  device_id: string;
+  user_id: string | null;
+  title: string;
+  scene_id: string;
+  lifecycle_status: CaptureTaskView['lifecycle'];
+  current_stage: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface StageRow {
+  stage: string;
+  status: CaptureStageView['status'];
+  retryable: number;
+  retry_count: number;
+  error_code: string | null;
+  error_message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
+}
+
+interface AssetRow {
+  id: string;
+  task_id: string;
+  object_key: string;
+  content_type: string;
+  expected_size_bytes: number | null;
+  actual_size_bytes: number | null;
+  etag: string | null;
+  status: 'awaiting_upload' | 'uploaded' | 'confirmed' | 'rejected';
+  upload_expires_at: string;
+  confirm_idempotency_key: string | null;
+}
+
+const json = <T>(body: ApiEnvelope<T>, status = 200): Response =>
+  Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
+
+const requestIdFor = (request: Request): string => {
+  const supplied = request.headers.get('x-request-id')?.trim();
+  return supplied && supplied.length <= 128 ? supplied : crypto.randomUUID();
+};
+
+const errorResponse = (
+  requestId: string,
+  status: number,
+  code: string,
+  message: string,
+  retryable = false,
+  taskId?: string,
+): Response =>
+  json(
+    {
+      ok: false,
+      error: { code, message, retryable },
+      requestId,
+      ...(taskId ? { taskId } : {}),
+    },
+    status,
+  );
+
+const sha256Hex = async (value: string): Promise<string> => {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+};
+
+async function authenticateDevice(
+  request: Request,
+  env: Env,
+): Promise<DeviceRow | null> {
+  const authorization = request.headers.get('authorization') ?? '';
+  const match = /^Bearer\s+(.+)$/i.exec(authorization);
+  const credential = match?.[1]?.trim();
+  if (!credential) return null;
+
+  const hash = await sha256Hex(`${env.DEVICE_AUTH_PEPPER}:${credential}`);
+  const device = await env.DB.prepare(
+    `SELECT id, user_id FROM devices
+     WHERE credential_hash = ? AND revoked_at IS NULL
+     LIMIT 1`,
+  )
+    .bind(hash)
+    .first<DeviceRow>();
+
+  if (device) {
+    void env.DB.prepare('UPDATE devices SET last_seen_at = ? WHERE id = ?')
+      .bind(new Date().toISOString(), device.id)
+      .run()
+      .catch(() => undefined);
+  }
+  return device;
+}
+
+const safeJson = async (request: Request): Promise<Record<string, unknown> | null> => {
+  try {
+    const value = await request.json();
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const parseCreateInput = (value: Record<string, unknown>): CreateCaptureTaskInput | null => {
+  const audio =
+    typeof value.audio === 'object' && value.audio !== null && !Array.isArray(value.audio)
+      ? (value.audio as Record<string, unknown>)
+      : null;
+  const idempotencyKey = typeof value.idempotencyKey === 'string' ? value.idempotencyKey.trim() : '';
+  const title = typeof value.title === 'string' ? value.title.trim() : '';
+  const sceneId = typeof value.sceneId === 'string' ? value.sceneId.trim() : '';
+  const contentType = typeof audio?.contentType === 'string' ? audio.contentType.trim() : '';
+  const sizeBytes = audio?.sizeBytes;
+
+  if (!idempotencyKey || idempotencyKey.length > 128 || !title || !sceneId || !contentType) {
+    return null;
+  }
+  if (
+    sizeBytes !== undefined &&
+    (!Number.isSafeInteger(sizeBytes) || typeof sizeBytes !== 'number' || sizeBytes <= 0)
+  ) {
+    return null;
+  }
+
+  return {
+    idempotencyKey,
+    title,
+    sceneId,
+    audio: {
+      contentType,
+      ...(typeof sizeBytes === 'number' ? { sizeBytes } : {}),
+    },
+  };
+};
+
+async function readTask(env: Env, taskId: string): Promise<CaptureTaskView | null> {
+  const task = await env.DB.prepare(
+    `SELECT id, device_id, user_id, title, scene_id, lifecycle_status, current_stage,
+            created_at, updated_at
+     FROM capture_tasks WHERE id = ? LIMIT 1`,
+  )
+    .bind(taskId)
+    .first<TaskRow>();
+  if (!task) return null;
+
+  const stageRows = await env.DB.prepare(
+    `SELECT stage, status, retryable, retry_count, error_code, error_message,
+            started_at, finished_at, updated_at
+     FROM capture_stages WHERE task_id = ? ORDER BY rowid ASC`,
+  )
+    .bind(taskId)
+    .all<StageRow>();
+
+  return {
+    id: task.id,
+    deviceId: task.device_id,
+    userId: task.user_id,
+    title: task.title,
+    sceneId: task.scene_id,
+    lifecycle: task.lifecycle_status,
+    currentStage: task.current_stage,
+    createdAt: task.created_at,
+    updatedAt: task.updated_at,
+    stages: (stageRows.results ?? []).map((stage) => ({
+      stage: stage.stage,
+      status: stage.status,
+      retryable: stage.retryable === 1,
+      retryCount: stage.retry_count,
+      errorCode: stage.error_code,
+      errorMessage: stage.error_message,
+      startedAt: stage.started_at,
+      finishedAt: stage.finished_at,
+      updatedAt: stage.updated_at,
+    })),
+  };
+}
+
+async function uploadGrant(env: Env, asset: AssetRow, now = new Date()): Promise<UploadGrant> {
+  const ttl = Number.parseInt(env.UPLOAD_TTL_SECONDS, 10);
+  const expiresInSeconds = Number.isFinite(ttl) ? Math.min(Math.max(ttl, 60), 3600) : 900;
+  const expiresAt = new Date(now.getTime() + expiresInSeconds * 1000).toISOString();
+  const url = await createPresignedR2PutUrl({
+    accountId: env.R2_ACCOUNT_ID,
+    bucket: env.R2_BUCKET_NAME,
+    objectKey: asset.object_key,
+    accessKeyId: env.R2_ACCESS_KEY_ID,
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    contentType: asset.content_type,
+    expiresInSeconds,
+    now,
+  });
+
+  return {
+    assetId: asset.id,
+    objectKey: asset.object_key,
+    method: 'PUT',
+    url,
+    expiresAt,
+    headers: { 'content-type': asset.content_type },
+  };
+}
+
+async function createCaptureTask(
+  request: Request,
+  env: Env,
+  device: DeviceRow,
+  requestId: string,
+): Promise<Response> {
+  const raw = await safeJson(request);
+  const input = raw ? parseCreateInput(raw) : null;
+  if (!input) {
+    return errorResponse(requestId, 400, 'invalid_request', 'Invalid CaptureTask request');
+  }
+
+  const existing = await env.DB.prepare(
+    `SELECT id FROM capture_tasks
+     WHERE device_id = ? AND create_idempotency_key = ? LIMIT 1`,
+  )
+    .bind(device.id, input.idempotencyKey)
+    .first<{ id: string }>();
+
+  if (existing) {
+    const task = await readTask(env, existing.id);
+    const asset = await env.DB.prepare(
+      `SELECT id, task_id, object_key, content_type, expected_size_bytes,
+              actual_size_bytes, etag, status, upload_expires_at, confirm_idempotency_key
+       FROM audio_assets WHERE task_id = ? ORDER BY created_at ASC LIMIT 1`,
+    )
+      .bind(existing.id)
+      .first<AssetRow>();
+    if (!task || !asset) {
+      return errorResponse(requestId, 500, 'canonical_state_missing', 'CaptureTask state is incomplete', false, existing.id);
+    }
+    const grant = asset.status === 'awaiting_upload' ? await uploadGrant(env, asset) : null;
+    return json({ ok: true, data: { task, upload: grant }, requestId });
+  }
+
+  const now = new Date().toISOString();
+  const taskId = crypto.randomUUID();
+  const assetId = crypto.randomUUID();
+  const objectKey = `audio/ephemeral/${taskId}/${assetId}`;
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO capture_tasks
+       (id, device_id, user_id, title, scene_id, lifecycle_status, current_stage,
+        create_idempotency_key, correlation_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'active', 'upload', ?, ?, ?, ?)`,
+    ).bind(taskId, device.id, device.user_id, input.title, input.sceneId, input.idempotencyKey, requestId, now, now),
+    env.DB.prepare(
+      `INSERT INTO capture_stages
+       (task_id, stage, status, retryable, retry_count, started_at, updated_at)
+       VALUES (?, 'upload', 'running', 1, 0, ?, ?)`,
+    ).bind(taskId, now, now),
+    env.DB.prepare(
+      `INSERT INTO audio_assets
+       (id, task_id, object_key, content_type, expected_size_bytes, status,
+        upload_expires_at, created_at)
+       VALUES (?, ?, ?, ?, ?, 'awaiting_upload', ?, ?)`,
+    ).bind(assetId, taskId, objectKey, input.audio.contentType, input.audio.sizeBytes ?? null, expiresAt, now),
+  ]);
+
+  const task = await readTask(env, taskId);
+  const asset = await env.DB.prepare(
+    `SELECT id, task_id, object_key, content_type, expected_size_bytes,
+            actual_size_bytes, etag, status, upload_expires_at, confirm_idempotency_key
+     FROM audio_assets WHERE id = ? LIMIT 1`,
+  )
+    .bind(assetId)
+    .first<AssetRow>();
+  if (!task || !asset) {
+    return errorResponse(requestId, 500, 'canonical_state_missing', 'CaptureTask creation did not persist canonical state', false, taskId);
+  }
+
+  return json(
+    { ok: true, data: { task, upload: await uploadGrant(env, asset) }, requestId },
+    201,
+  );
+}
+
+async function getCaptureTask(
+  env: Env,
+  device: DeviceRow,
+  taskId: string,
+  requestId: string,
+): Promise<Response> {
+  const task = await readTask(env, taskId);
+  if (!task || task.deviceId !== device.id) {
+    return errorResponse(requestId, 404, 'task_not_found', 'CaptureTask not found');
+  }
+  return json({ ok: true, data: { task }, requestId });
+}
+
+async function confirmAudio(
+  request: Request,
+  env: Env,
+  device: DeviceRow,
+  taskId: string,
+  requestId: string,
+): Promise<Response> {
+  const task = await readTask(env, taskId);
+  if (!task || task.deviceId !== device.id) {
+    return errorResponse(requestId, 404, 'task_not_found', 'CaptureTask not found');
+  }
+
+  const raw = await safeJson(request);
+  const assetId = typeof raw?.assetId === 'string' ? raw.assetId.trim() : '';
+  const idempotencyKey = typeof raw?.idempotencyKey === 'string' ? raw.idempotencyKey.trim() : '';
+  if (!assetId || !idempotencyKey || idempotencyKey.length > 128) {
+    return errorResponse(requestId, 400, 'invalid_request', 'assetId and idempotencyKey are required', false, taskId);
+  }
+
+  const asset = await env.DB.prepare(
+    `SELECT id, task_id, object_key, content_type, expected_size_bytes,
+            actual_size_bytes, etag, status, upload_expires_at, confirm_idempotency_key
+     FROM audio_assets WHERE id = ? AND task_id = ? LIMIT 1`,
+  )
+    .bind(assetId, taskId)
+    .first<AssetRow>();
+  if (!asset) {
+    return errorResponse(requestId, 404, 'asset_not_found', 'Audio asset not found', false, taskId);
+  }
+
+  if (asset.status === 'confirmed') {
+    if (asset.confirm_idempotency_key !== idempotencyKey) {
+      return errorResponse(requestId, 409, 'asset_already_confirmed', 'Audio asset was confirmed by another request identity', false, taskId);
+    }
+    return json({ ok: true, data: { task: await readTask(env, taskId) }, requestId });
+  }
+
+  const object = await env.AUDIO.head(asset.object_key);
+  if (!object) {
+    return errorResponse(requestId, 409, 'audio_object_missing', 'Uploaded audio object does not exist yet', true, taskId);
+  }
+  if (asset.expected_size_bytes !== null && object.size !== asset.expected_size_bytes) {
+    return errorResponse(requestId, 409, 'audio_size_mismatch', 'Uploaded audio size does not match the declared asset', true, taskId);
+  }
+  const objectContentType = object.httpMetadata?.contentType;
+  if (objectContentType && objectContentType !== asset.content_type) {
+    return errorResponse(requestId, 409, 'audio_content_type_mismatch', 'Uploaded audio content type does not match the signed grant', false, taskId);
+  }
+
+  const now = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE audio_assets
+       SET status = 'confirmed', actual_size_bytes = ?, etag = ?,
+           confirm_idempotency_key = ?, confirmed_at = ?
+       WHERE id = ?`,
+    ).bind(object.size, object.etag, idempotencyKey, now, asset.id),
+    env.DB.prepare(
+      `UPDATE capture_stages
+       SET status = 'succeeded', retryable = 0, error_code = NULL, error_message = NULL,
+           finished_at = ?, updated_at = ?
+       WHERE task_id = ? AND stage = 'upload'`,
+    ).bind(now, now, taskId),
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO capture_stages
+       (task_id, stage, status, retryable, retry_count, updated_at)
+       VALUES (?, 'verify-audio', 'pending', 1, 0, ?)`,
+    ).bind(taskId, now),
+    env.DB.prepare(
+      `UPDATE capture_tasks SET current_stage = 'verify-audio', updated_at = ? WHERE id = ?`,
+    ).bind(now, taskId),
+  ]);
+
+  try {
+    await env.CAPTURE_WORKFLOW.create({
+      id: `capture-${taskId}`,
+      params: { taskId, objectKey: asset.object_key, requestId },
+    });
+  } catch {
+    await env.DB.prepare(
+      `UPDATE capture_stages
+       SET status = 'failed', retryable = 1, retry_count = retry_count + 1,
+           error_code = 'workflow_start_failed',
+           error_message = 'Workflow could not be started', updated_at = ?
+       WHERE task_id = ? AND stage = 'verify-audio'`,
+    )
+      .bind(new Date().toISOString(), taskId)
+      .run();
+    return errorResponse(requestId, 503, 'workflow_start_failed', 'Audio is confirmed but processing could not start yet', true, taskId);
+  }
+
+  return json({ ok: true, data: { task: await readTask(env, taskId) }, requestId });
+}
+
+export class ShiyanCaptureWorkflow extends WorkflowEntrypoint<Env, { taskId: string; objectKey: string; requestId: string }> {
+  async run(event: { payload: { taskId: string; objectKey: string } }, step: { do<T>(name: string, callback: () => Promise<T>): Promise<T> }) {
+    const { taskId, objectKey } = event.payload;
+    await step.do('verify-audio', async () => {
+      const now = new Date().toISOString();
+      await this.env.DB.prepare(
+        `UPDATE capture_stages
+         SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
+         WHERE task_id = ? AND stage = 'verify-audio'`,
+      )
+        .bind(now, now, taskId)
+        .run();
+
+      const object = await this.env.AUDIO.head(objectKey);
+      if (!object) throw new Error('audio_object_missing');
+
+      const finishedAt = new Date().toISOString();
+      await this.env.DB.prepare(
+        `UPDATE capture_stages
+         SET status = 'succeeded', retryable = 0, error_code = NULL, error_message = NULL,
+             finished_at = ?, updated_at = ?
+         WHERE task_id = ? AND stage = 'verify-audio'`,
+      )
+        .bind(finishedAt, finishedAt, taskId)
+        .run();
+      return { taskId };
+    });
+
+    // MOB-018 intentionally stops here. MOB-019 owns transcription and the next
+    // Workflow stages. The Task remains active and truthfully points at the last
+    // implemented stage instead of pretending that STT/LLM already completed.
+  }
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const requestId = requestIdFor(request);
+    const url = new URL(request.url);
+
+    if (request.method === 'GET' && url.pathname === '/health') {
+      return json({ ok: true, data: { service: 'shiyan-api' }, requestId });
+    }
+
+    const device = await authenticateDevice(request, env);
+    if (!device) {
+      return errorResponse(requestId, 401, 'device_unauthorized', 'Valid Shiyan device credential required');
+    }
+
+    if (request.method === 'POST' && url.pathname === '/v1/capture-tasks') {
+      return createCaptureTask(request, env, device, requestId);
+    }
+
+    const taskMatch = /^\/v1\/capture-tasks\/([^/]+)$/.exec(url.pathname);
+    if (request.method === 'GET' && taskMatch) {
+      return getCaptureTask(env, device, decodeURIComponent(taskMatch[1]), requestId);
+    }
+
+    const confirmMatch = /^\/v1\/capture-tasks\/([^/]+)\/audio\/confirm$/.exec(url.pathname);
+    if (request.method === 'POST' && confirmMatch) {
+      return confirmAudio(request, env, device, decodeURIComponent(confirmMatch[1]), requestId);
+    }
+
+    return errorResponse(requestId, 404, 'route_not_found', 'Route not found');
+  },
+};
