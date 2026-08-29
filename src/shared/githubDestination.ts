@@ -98,12 +98,18 @@ export const renderGithubDestinationMarkdown = (input: DestinationDeliveryInput)
 };
 
 const retryAfterSeconds = (response: Response): number | undefined => {
-  const direct = Number(response.headers.get('retry-after'));
-  if (Number.isFinite(direct) && direct >= 0) return Math.ceil(direct);
+  const retryAfter = response.headers.get('retry-after');
+  if (retryAfter !== null && retryAfter.trim() !== '') {
+    const direct = Number(retryAfter);
+    if (Number.isFinite(direct) && direct >= 0) return Math.ceil(direct);
+  }
   if (response.headers.get('x-ratelimit-remaining') === '0') {
-    const reset = Number(response.headers.get('x-ratelimit-reset'));
-    if (Number.isFinite(reset)) {
-      return Math.max(0, Math.ceil(reset - Date.now() / 1000));
+    const resetHeader = response.headers.get('x-ratelimit-reset');
+    if (resetHeader !== null && resetHeader.trim() !== '') {
+      const reset = Number(resetHeader);
+      if (Number.isFinite(reset)) {
+        return Math.max(0, Math.ceil(reset - Date.now() / 1000));
+      }
     }
   }
   return undefined;
