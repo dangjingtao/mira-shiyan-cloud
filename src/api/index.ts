@@ -39,6 +39,7 @@ interface R2BucketLike {
 
 interface WorkflowBindingLike {
   create(input?: { id?: string; params?: Record<string, unknown> }): Promise<unknown>;
+  get(id: string): Promise<unknown>;
 }
 
 interface Env {
@@ -95,6 +96,9 @@ interface AssetRow {
   upload_expires_at: string;
   confirm_idempotency_key: string | null;
 }
+
+const TASK_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 const json = <T>(body: ApiEnvelope<T>, status = 200): Response =>
   Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
@@ -162,6 +166,15 @@ const safeJson = async (request: Request): Promise<Record<string, unknown> | nul
     return typeof value === 'object' && value !== null && !Array.isArray(value)
       ? (value as Record<string, unknown>)
       : null;
+  } catch {
+    return null;
+  }
+};
+
+const parseTaskIdPathParam = (value: string): string | null => {
+  try {
+    const decoded = decodeURIComponent(value);
+    return TASK_ID_PATTERN.test(decoded) ? decoded : null;
   } catch {
     return null;
   }
@@ -241,6 +254,16 @@ async function readTask(env: Env, taskId: string): Promise<CaptureTaskView | nul
   };
 }
 
+async function readFirstAsset(env: Env, taskId: string): Promise<AssetRow | null> {
+  return env.DB.prepare(
+    `SELECT id, task_id, object_key, content_type, expected_size_bytes,
+            actual_size_bytes, etag, status, upload_expires_at, confirm_idempotency_key
+     FROM audio_assets WHERE task_id = ? ORDER BY created_at ASC LIMIT 1`,
+  )
+    .bind(taskId)
+    .first<AssetRow>();
+}
+
 async function uploadGrant(env: Env, asset: AssetRow, now = new Date()): Promise<UploadGrant> {
   const ttl = Number.parseInt(env.UPLOAD_TTL_SECONDS, 10);
   const expiresInSeconds = Number.isFinite(ttl) ? Math.min(Math.max(ttl, 60), 3600) : 900;
@@ -266,6 +289,67 @@ async function uploadGrant(env: Env, asset: AssetRow, now = new Date()): Promise
   };
 }
 
+async function canonicalCaptureTaskResponse(
+  env: Env,
+  taskId: string,
+  requestId: string,
+  status = 200,
+): Promise<Response> {
+  const task = await readTask(env, taskId);
+  const asset = await readFirstAsset(env, taskId);
+  if (!task || !asset) {
+    return errorResponse(
+      requestId,
+      500,
+      'canonical_state_missing',
+      'CaptureTask state is incomplete',
+      false,
+      taskId,
+    );
+  }
+  const grant = asset.status === 'awaiting_upload' ? await uploadGrant(env, asset) : null;
+  return json({ ok: true, data: { task, upload: grant }, requestId }, status);
+}
+
+async function captureWorkflowExists(env: Env, workflowId: string): Promise<boolean> {
+  try {
+    await env.CAPTURE_WORKFLOW.get(workflowId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureCaptureWorkflowStarted(
+  env: Env,
+  taskId: string,
+  objectKey: string,
+  requestId: string,
+): Promise<boolean> {
+  const workflowId = `capture-${taskId}`;
+  try {
+    await env.CAPTURE_WORKFLOW.create({
+      id: workflowId,
+      params: { taskId, objectKey, requestId },
+    });
+    return true;
+  } catch {
+    return captureWorkflowExists(env, workflowId);
+  }
+}
+
+async function markWorkflowStartFailed(env: Env, taskId: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE capture_stages
+     SET status = 'failed', retryable = 1, retry_count = retry_count + 1,
+         error_code = 'workflow_start_failed',
+         error_message = 'Workflow could not be started', updated_at = ?
+     WHERE task_id = ? AND stage = 'verify-audio'`,
+  )
+    .bind(new Date().toISOString(), taskId)
+    .run();
+}
+
 async function createCaptureTask(
   request: Request,
   env: Env,
@@ -286,19 +370,7 @@ async function createCaptureTask(
     .first<{ id: string }>();
 
   if (existing) {
-    const task = await readTask(env, existing.id);
-    const asset = await env.DB.prepare(
-      `SELECT id, task_id, object_key, content_type, expected_size_bytes,
-              actual_size_bytes, etag, status, upload_expires_at, confirm_idempotency_key
-       FROM audio_assets WHERE task_id = ? ORDER BY created_at ASC LIMIT 1`,
-    )
-      .bind(existing.id)
-      .first<AssetRow>();
-    if (!task || !asset) {
-      return errorResponse(requestId, 500, 'canonical_state_missing', 'CaptureTask state is incomplete', false, existing.id);
-    }
-    const grant = asset.status === 'awaiting_upload' ? await uploadGrant(env, asset) : null;
-    return json({ ok: true, data: { task, upload: grant }, requestId });
+    return canonicalCaptureTaskResponse(env, existing.id, requestId);
   }
 
   const now = new Date().toISOString();
@@ -307,42 +379,46 @@ async function createCaptureTask(
   const objectKey = `audio/ephemeral/${taskId}/${assetId}`;
   const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
-  await env.DB.batch([
-    env.DB.prepare(
-      `INSERT INTO capture_tasks
-       (id, device_id, user_id, title, scene_id, lifecycle_status, current_stage,
-        create_idempotency_key, correlation_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'active', 'upload', ?, ?, ?, ?)`,
-    ).bind(taskId, device.id, device.user_id, input.title, input.sceneId, input.idempotencyKey, requestId, now, now),
-    env.DB.prepare(
-      `INSERT INTO capture_stages
-       (task_id, stage, status, retryable, retry_count, started_at, updated_at)
-       VALUES (?, 'upload', 'running', 1, 0, ?, ?)`,
-    ).bind(taskId, now, now),
-    env.DB.prepare(
-      `INSERT INTO audio_assets
-       (id, task_id, object_key, content_type, expected_size_bytes, status,
-        upload_expires_at, created_at)
-       VALUES (?, ?, ?, ?, ?, 'awaiting_upload', ?, ?)`,
-    ).bind(assetId, taskId, objectKey, input.audio.contentType, input.audio.sizeBytes ?? null, expiresAt, now),
-  ]);
-
-  const task = await readTask(env, taskId);
-  const asset = await env.DB.prepare(
-    `SELECT id, task_id, object_key, content_type, expected_size_bytes,
-            actual_size_bytes, etag, status, upload_expires_at, confirm_idempotency_key
-     FROM audio_assets WHERE id = ? LIMIT 1`,
-  )
-    .bind(assetId)
-    .first<AssetRow>();
-  if (!task || !asset) {
-    return errorResponse(requestId, 500, 'canonical_state_missing', 'CaptureTask creation did not persist canonical state', false, taskId);
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO capture_tasks
+         (id, device_id, user_id, title, scene_id, lifecycle_status, current_stage,
+          create_idempotency_key, correlation_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'active', 'upload', ?, ?, ?, ?)`,
+      ).bind(taskId, device.id, device.user_id, input.title, input.sceneId, input.idempotencyKey, requestId, now, now),
+      env.DB.prepare(
+        `INSERT INTO capture_stages
+         (task_id, stage, status, retryable, retry_count, started_at, updated_at)
+         VALUES (?, 'upload', 'running', 1, 0, ?, ?)`,
+      ).bind(taskId, now, now),
+      env.DB.prepare(
+        `INSERT INTO audio_assets
+         (id, task_id, object_key, content_type, expected_size_bytes, status,
+          upload_expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, 'awaiting_upload', ?, ?)`,
+      ).bind(assetId, taskId, objectKey, input.audio.contentType, input.audio.sizeBytes ?? null, expiresAt, now),
+    ]);
+  } catch {
+    const winner = await env.DB.prepare(
+      `SELECT id FROM capture_tasks
+       WHERE device_id = ? AND create_idempotency_key = ? LIMIT 1`,
+    )
+      .bind(device.id, input.idempotencyKey)
+      .first<{ id: string }>();
+    if (winner) {
+      return canonicalCaptureTaskResponse(env, winner.id, requestId);
+    }
+    return errorResponse(
+      requestId,
+      500,
+      'capture_task_create_failed',
+      'CaptureTask could not be created',
+      true,
+    );
   }
 
-  return json(
-    { ok: true, data: { task, upload: await uploadGrant(env, asset) }, requestId },
-    201,
-  );
+  return canonicalCaptureTaskResponse(env, taskId, requestId, 201);
 }
 
 async function getCaptureTask(
@@ -392,6 +468,53 @@ async function confirmAudio(
     if (asset.confirm_idempotency_key !== idempotencyKey) {
       return errorResponse(requestId, 409, 'asset_already_confirmed', 'Audio asset was confirmed by another request identity', false, taskId);
     }
+
+    const latestTask = await readTask(env, taskId);
+    const verifyStage = latestTask?.stages.find((stage) => stage.stage === 'verify-audio');
+    if (!latestTask || !verifyStage) {
+      return errorResponse(
+        requestId,
+        500,
+        'canonical_state_missing',
+        'Confirmed audio is missing verify-audio stage state',
+        false,
+        taskId,
+      );
+    }
+
+    const needsWorkflowRecovery =
+      verifyStage.status === 'pending' ||
+      (verifyStage.status === 'failed' && verifyStage.errorCode === 'workflow_start_failed');
+    if (needsWorkflowRecovery) {
+      const retryAt = new Date().toISOString();
+      await env.DB.prepare(
+        `UPDATE capture_stages
+         SET status = 'pending', retryable = 1, error_code = NULL, error_message = NULL,
+             finished_at = NULL, updated_at = ?
+         WHERE task_id = ? AND stage = 'verify-audio'`,
+      )
+        .bind(retryAt, taskId)
+        .run();
+
+      const started = await ensureCaptureWorkflowStarted(
+        env,
+        taskId,
+        asset.object_key,
+        requestId,
+      );
+      if (!started) {
+        await markWorkflowStartFailed(env, taskId);
+        return errorResponse(
+          requestId,
+          503,
+          'workflow_start_failed',
+          'Audio is confirmed but processing could not start yet',
+          true,
+          taskId,
+        );
+      }
+    }
+
     return json({ ok: true, data: { task: await readTask(env, taskId) }, requestId });
   }
 
@@ -431,21 +554,14 @@ async function confirmAudio(
     ).bind(now, taskId),
   ]);
 
-  try {
-    await env.CAPTURE_WORKFLOW.create({
-      id: `capture-${taskId}`,
-      params: { taskId, objectKey: asset.object_key, requestId },
-    });
-  } catch {
-    await env.DB.prepare(
-      `UPDATE capture_stages
-       SET status = 'failed', retryable = 1, retry_count = retry_count + 1,
-           error_code = 'workflow_start_failed',
-           error_message = 'Workflow could not be started', updated_at = ?
-       WHERE task_id = ? AND stage = 'verify-audio'`,
-    )
-      .bind(new Date().toISOString(), taskId)
-      .run();
+  const started = await ensureCaptureWorkflowStarted(
+    env,
+    taskId,
+    asset.object_key,
+    requestId,
+  );
+  if (!started) {
+    await markWorkflowStartFailed(env, taskId);
     return errorResponse(requestId, 503, 'workflow_start_failed', 'Audio is confirmed but processing could not start yet', true, taskId);
   }
 
@@ -506,12 +622,20 @@ export default {
 
     const taskMatch = /^\/v1\/capture-tasks\/([^/]+)$/.exec(url.pathname);
     if (request.method === 'GET' && taskMatch) {
-      return getCaptureTask(env, device, decodeURIComponent(taskMatch[1]), requestId);
+      const taskId = parseTaskIdPathParam(taskMatch[1]);
+      if (!taskId) {
+        return errorResponse(requestId, 400, 'invalid_task_id', 'Invalid CaptureTask id');
+      }
+      return getCaptureTask(env, device, taskId, requestId);
     }
 
     const confirmMatch = /^\/v1\/capture-tasks\/([^/]+)\/audio\/confirm$/.exec(url.pathname);
     if (request.method === 'POST' && confirmMatch) {
-      return confirmAudio(request, env, device, decodeURIComponent(confirmMatch[1]), requestId);
+      const taskId = parseTaskIdPathParam(confirmMatch[1]);
+      if (!taskId) {
+        return errorResponse(requestId, 400, 'invalid_task_id', 'Invalid CaptureTask id');
+      }
+      return confirmAudio(request, env, device, taskId, requestId);
     }
 
     return errorResponse(requestId, 404, 'route_not_found', 'Route not found');
