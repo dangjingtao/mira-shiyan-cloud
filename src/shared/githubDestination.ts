@@ -3,6 +3,7 @@ import type {
   DestinationDeliveryInput,
   DestinationFailure,
   DestinationResult,
+  DestinationSuccess,
 } from './destination';
 
 export interface GithubDestinationConfig {
@@ -227,6 +228,87 @@ export class GithubDestinationAdapter implements DestinationAdapter {
         };
   }
 
+  private async recoverExistingIdentical(
+    path: string,
+    markdown: string,
+  ): Promise<{ found: false } | { found: true; result: DestinationResult }> {
+    const url = this.contentUrl(path);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${url}?ref=${encodeURIComponent(this.branch)}`, {
+        method: 'GET',
+        headers: this.headers(),
+      });
+    } catch {
+      return { found: true, result: { ok: false, error: networkFailure() } };
+    }
+    if (response.status === 404) return { found: false };
+    if (!response.ok) {
+      return { found: true, result: { ok: false, error: classifyGithubFailure(response) } };
+    }
+
+    const existing = (await response.json()) as GithubContentResponse;
+    if (existing.type !== 'file' || existing.encoding !== 'base64' || typeof existing.content !== 'string') {
+      return {
+        found: true,
+        result: {
+          ok: false,
+          error: {
+            kind: 'terminal',
+            code: 'github_path_conflict',
+            message: 'GitHub target path exists but is not the expected Markdown file',
+          },
+        },
+      };
+    }
+
+    let existingMarkdown: string;
+    try {
+      existingMarkdown = base64ToUtf8(existing.content);
+    } catch {
+      return {
+        found: true,
+        result: {
+          ok: false,
+          error: {
+            kind: 'retryable',
+            code: 'github_content_unreadable',
+            message: 'Existing GitHub destination content could not be verified',
+          },
+        },
+      };
+    }
+    if (existingMarkdown !== markdown) {
+      return {
+        found: true,
+        result: {
+          ok: false,
+          error: {
+            kind: 'terminal',
+            code: 'github_path_conflict',
+            message: 'GitHub target path already contains different confirmed content',
+          },
+        },
+      };
+    }
+
+    const commitSha = await this.latestCommitSha(path);
+    if (typeof commitSha !== 'string') {
+      return { found: true, result: { ok: false, error: commitSha } };
+    }
+    const value: DestinationSuccess = {
+      destination: 'github',
+      repository: `${this.owner}/${this.repository}`,
+      path,
+      commitSha,
+      fileUrl:
+        existing.html_url ??
+        `https://github.com/${this.owner}/${this.repository}/blob/${this.branch}/${path}`,
+      deliveredAt: new Date().toISOString(),
+    };
+    return { found: true, result: { ok: true, value } };
+  }
+
   async deliver(input: DestinationDeliveryInput): Promise<DestinationResult> {
     if (!this.config.token || !input.taskId || !input.finalDraftId || !input.idempotencyKey) {
       return {
@@ -254,73 +336,10 @@ export class GithubDestinationAdapter implements DestinationAdapter {
     }
 
     const markdown = renderGithubDestinationMarkdown(input);
+    const existing = await this.recoverExistingIdentical(path, markdown);
+    if (existing.found) return existing.result;
+
     const url = this.contentUrl(path);
-    let existingResponse: Response;
-    try {
-      existingResponse = await this.fetchImpl(`${url}?ref=${encodeURIComponent(this.branch)}`, {
-        method: 'GET',
-        headers: this.headers(),
-      });
-    } catch {
-      return { ok: false, error: networkFailure() };
-    }
-
-    if (existingResponse.ok) {
-      const existing = (await existingResponse.json()) as GithubContentResponse;
-      if (existing.type !== 'file' || existing.encoding !== 'base64' || typeof existing.content !== 'string') {
-        return {
-          ok: false,
-          error: {
-            kind: 'terminal',
-            code: 'github_path_conflict',
-            message: 'GitHub target path exists but is not the expected Markdown file',
-          },
-        };
-      }
-      let existingMarkdown: string;
-      try {
-        existingMarkdown = base64ToUtf8(existing.content);
-      } catch {
-        return {
-          ok: false,
-          error: {
-            kind: 'retryable',
-            code: 'github_content_unreadable',
-            message: 'Existing GitHub destination content could not be verified',
-          },
-        };
-      }
-      if (existingMarkdown !== markdown) {
-        return {
-          ok: false,
-          error: {
-            kind: 'terminal',
-            code: 'github_path_conflict',
-            message: 'GitHub target path already contains different confirmed content',
-          },
-        };
-      }
-      const commitSha = await this.latestCommitSha(path);
-      if (typeof commitSha !== 'string') return { ok: false, error: commitSha };
-      return {
-        ok: true,
-        value: {
-          destination: 'github',
-          repository: `${this.owner}/${this.repository}`,
-          path,
-          commitSha,
-          fileUrl:
-            existing.html_url ??
-            `https://github.com/${this.owner}/${this.repository}/blob/${this.branch}/${path}`,
-          deliveredAt: new Date().toISOString(),
-        },
-      };
-    }
-
-    if (existingResponse.status !== 404) {
-      return { ok: false, error: classifyGithubFailure(existingResponse) };
-    }
-
     let writeResponse: Response;
     try {
       writeResponse = await this.fetchImpl(url, {
@@ -337,6 +356,10 @@ export class GithubDestinationAdapter implements DestinationAdapter {
     }
 
     if (!writeResponse.ok) {
+      if (writeResponse.status === 409 || writeResponse.status === 422) {
+        const recovered = await this.recoverExistingIdentical(path, markdown);
+        if (recovered.found) return recovered.result;
+      }
       return { ok: false, error: classifyGithubFailure(writeResponse) };
     }
 
