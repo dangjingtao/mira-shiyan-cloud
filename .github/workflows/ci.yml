@@ -21,7 +21,7 @@ jobs:
       - name: Typecheck
         run: npx --yes -p typescript@5.9.2 tsc -p tsconfig.json
       - name: Shiyan workflow and destination tests
-        run: npx --yes tsx@4.20.5 --test tests/stt.test.ts tests/mob019.workflow.test.ts tests/mob022.destination.test.ts
+        run: npx --yes tsx@4.20.5 --test tests/stt.test.ts tests/mob019.workflow.test.ts tests/mob022.destination.test.ts tests/mob022.delivery.test.ts
       - name: Dry-run public API Worker
         run: npx --yes wrangler@4.79.0 deploy --dry-run -c wrangler.api.jsonc
       - name: Dry-run private LLM Worker
