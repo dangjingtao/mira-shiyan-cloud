@@ -1,0 +1,31 @@
+name: Shiyan Cloud CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Generate Cloudflare runtime and binding types
+        run: npx --yes wrangler@4.79.0 types worker-configuration.d.ts -c wrangler.api.jsonc
+      - name: Typecheck
+        run: npx --yes -p typescript@5.9.2 tsc -p tsconfig.json
+      - name: Dry-run public API Worker
+        run: npx --yes wrangler@4.79.0 deploy --dry-run -c wrangler.api.jsonc
+      - name: Dry-run private LLM Worker
+        run: npx --yes wrangler@4.79.0 deploy --dry-run -c wrangler.llm.jsonc
+      - name: Verify D1 migration is repeatable
+        run: |
+          sqlite3 /tmp/shiyan.db < migrations/0001_capture_foundation.sql
+          sqlite3 /tmp/shiyan.db < migrations/0001_capture_foundation.sql
+          sqlite3 /tmp/shiyan.db '.schema'
