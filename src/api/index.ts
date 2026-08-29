@@ -7,7 +7,9 @@ import {
   type Mob019WorkflowPayload,
   type Mob019WorkflowStep,
 } from './mob019';
+import { handleMob020Request, runMob020Organize } from './mob020';
 import { createPresignedR2PutUrl } from '../shared/r2Presign';
+import type { ShiyanLlmBinding } from '../shared/llm';
 import type {
   ApiEnvelope,
   CaptureStageView,
@@ -69,7 +71,7 @@ interface Env {
     run(model: string, input: Record<string, unknown>): Promise<unknown>;
   };
   CAPTURE_WORKFLOW: WorkflowBindingLike;
-  SHIYAN_LLM: unknown;
+  SHIYAN_LLM: ShiyanLlmBinding;
   R2_ACCOUNT_ID: string;
   R2_ACCESS_KEY_ID: string;
   R2_SECRET_ACCESS_KEY: string;
@@ -600,7 +602,16 @@ export class ShiyanCaptureWorkflow extends WorkflowEntrypoint<Env, Mob019Workflo
     event: { payload: Mob019WorkflowPayload },
     step: Mob019WorkflowStep,
   ): Promise<void> {
-    await runMob019Workflow(this.env, event.payload, step);
+    // Organize retries skip the STT chain entirely: the Transcript evidence
+    // layer is already persisted and must never be re-run or overwritten.
+    if (event.payload.startStage === 'organize') {
+      await runMob020Organize(this.env, event.payload, step);
+      return;
+    }
+
+    const stt = await runMob019Workflow(this.env, event.payload, step);
+    if (!stt.ok) return;
+    await runMob020Organize(this.env, event.payload, step);
   }
 }
 
@@ -642,6 +653,9 @@ export default {
 
     const mob019Response = await handleMob019Request(request, env, device, requestId);
     if (mob019Response) return mob019Response;
+
+    const mob020Response = await handleMob020Request(request, env, device, requestId);
+    if (mob020Response) return mob020Response;
 
     return errorResponse(requestId, 404, 'route_not_found', 'Route not found');
   },

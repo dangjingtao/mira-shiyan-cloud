@@ -1,24 +1,29 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
+import type { AdjustRequest, LlmOutcome, OrganizeRequest } from '../shared/llm';
+import { ShiyanLlmGateway, resolveLlmSlots, type LlmEnvLike } from '../shared/llmGateway';
 
-export interface OrganizeRequest {
-  taskId: string;
-  sceneId: string;
-  transcriptId: string;
-}
+export type { AdjustRequest, LlmOutcome, OrganizeRequest } from '../shared/llm';
 
-export interface OrganizeResult {
-  markdown: string;
-  structured: Record<string, unknown>;
-  provider: string;
-  latencyMs: number;
-}
+/**
+ * Private LLM service Worker (MOB-020).
+ *
+ * - Reached only through the `shiyan-api` Service Binding; it has no public
+ *   route and never touches D1, so it cannot interpret CaptureTask state.
+ * - Holds provider configuration; API keys live in Cloudflare secrets.
+ * - Answers with normalized outcomes: raw provider errors and keys never
+ *   cross the binding.
+ */
+export class ShiyanLlmWorker extends WorkerEntrypoint<LlmEnvLike> {
+  private gateway(): ShiyanLlmGateway {
+    return new ShiyanLlmGateway(resolveLlmSlots(this.env));
+  }
 
-export class ShiyanLlmWorker extends WorkerEntrypoint {
-  async generateStructured(_input: OrganizeRequest): Promise<OrganizeResult> {
-    // MOB-018 only establishes the private Service Binding boundary. Provider
-    // selection, secrets, fallback, structured validation and usage belong to
-    // MOB-020 and must not be faked here.
-    throw new Error('provider_not_configured');
+  async generateStructured(input: OrganizeRequest): Promise<LlmOutcome> {
+    return this.gateway().generateStructured(input);
+  }
+
+  async adjustDraft(input: AdjustRequest): Promise<LlmOutcome> {
+    return this.gateway().adjustDraft(input);
   }
 }
 

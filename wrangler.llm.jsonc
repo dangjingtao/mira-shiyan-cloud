@@ -4,5 +4,17 @@
   "main": "src/llm/index.ts",
   "compatibility_date": "2026-08-29",
   "workers_dev": false,
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
+  "vars": {
+    // Provider identity, endpoint and model are configuration; the API keys
+    // (LLM_PRIMARY_API_KEY / LLM_FALLBACK_API_KEY) are Cloudflare secrets.
+    "LLM_PRIMARY_PROVIDER": "deepseek",
+    "LLM_PRIMARY_BASE_URL": "https://api.deepseek.com/v1",
+    "LLM_PRIMARY_MODEL": "deepseek-chat",
+    "LLM_FALLBACK_PROVIDER": "moonshot",
+    "LLM_FALLBACK_BASE_URL": "https://api.moonshot.cn/v1",
+    "LLM_FALLBACK_MODEL": "moonshot-v1-32k",
+    "LLM_TIMEOUT_MS": "120000",
+    "LLM_MAX_TRANSCRIPT_CHARS": "200000"
+  }
 }
