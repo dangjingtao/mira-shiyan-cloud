@@ -93,6 +93,35 @@ test('uncertain retry reuses the same existing content instead of creating a dup
   assert.ok(calls.every((call) => call.init?.method !== 'PUT'));
 });
 
+test('concurrent create conflict re-reads identical content and recovers instead of duplicating', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const markdown = renderGithubDestinationMarkdown(INPUT);
+  const adapter = new GithubDestinationAdapter(
+    { token: 'secret-token' },
+    queuedFetch(
+      [
+        new Response(null, { status: 404 }),
+        new Response(null, { status: 422 }),
+        Response.json({
+          type: 'file',
+          encoding: 'base64',
+          content: base64(markdown),
+          html_url:
+            'https://github.com/dangjingtao/mira-shiyan/blob/main/entries/2026/08/11111111-1111-4111-8111-111111111111.md',
+        }),
+        Response.json([{ sha: 'commit-concurrent-1' }]),
+      ],
+      calls,
+    ),
+  );
+
+  const result = await adapter.deliver(INPUT);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.value.commitSha, 'commit-concurrent-1');
+  assert.equal(calls.filter((call) => call.init?.method === 'PUT').length, 1);
+});
+
 test('different content at the deterministic path is a terminal conflict', async () => {
   const adapter = new GithubDestinationAdapter(
     { token: 'secret-token' },
