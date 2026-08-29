@@ -843,6 +843,9 @@ export async function runMob019Workflow(
       const validation = await validateAssetForStt(env, payload.taskId, payload.objectKey);
       if (!validation.ok) {
         await markStageFailed(env, payload.taskId, 'verify-audio', validation.error);
+        if (validation.error.kind === 'retryable') {
+          throw new Error(validation.error.code);
+        }
         return { ok: false, errorCode: validation.error.code } as const;
       }
       await markVerifySucceeded(env, payload.taskId);
