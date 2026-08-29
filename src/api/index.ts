@@ -1,4 +1,12 @@
 import { WorkflowEntrypoint } from 'cloudflare:workers';
+import {
+  cleanupExpiredAudio,
+  ensureDefaultAudioRetention,
+  handleMob019Request,
+  runMob019Workflow,
+  type Mob019WorkflowPayload,
+  type Mob019WorkflowStep,
+} from './mob019';
 import { createPresignedR2PutUrl } from '../shared/r2Presign';
 import type {
   ApiEnvelope,
@@ -33,8 +41,20 @@ interface R2ObjectLike {
   httpMetadata?: { contentType?: string };
 }
 
+interface R2ObjectBodyLike extends R2ObjectLike {
+  arrayBuffer(): Promise<ArrayBuffer>;
+  text(): Promise<string>;
+}
+
 interface R2BucketLike {
   head(key: string): Promise<R2ObjectLike | null>;
+  get(key: string): Promise<R2ObjectBodyLike | null>;
+  put(
+    key: string,
+    value: string | ArrayBuffer | ArrayBufferView,
+    options?: { httpMetadata?: { contentType?: string } },
+  ): Promise<unknown>;
+  delete(key: string): Promise<void>;
 }
 
 interface WorkflowBindingLike {
@@ -45,6 +65,9 @@ interface WorkflowBindingLike {
 interface Env {
   DB: D1DatabaseLike;
   AUDIO: R2BucketLike;
+  AI: {
+    run(model: string, input: Record<string, unknown>): Promise<unknown>;
+  };
   CAPTURE_WORKFLOW: WorkflowBindingLike;
   SHIYAN_LLM: unknown;
   R2_ACCOUNT_ID: string;
@@ -330,7 +353,7 @@ async function ensureCaptureWorkflowStarted(
   try {
     await env.CAPTURE_WORKFLOW.create({
       id: workflowId,
-      params: { taskId, objectKey, requestId },
+      params: { taskId, objectKey, requestId, startStage: 'verify-audio' },
     });
     return true;
   } catch {
@@ -469,6 +492,8 @@ async function confirmAudio(
       return errorResponse(requestId, 409, 'asset_already_confirmed', 'Audio asset was confirmed by another request identity', false, taskId);
     }
 
+    await ensureDefaultAudioRetention(env, asset.id);
+
     const latestTask = await readTask(env, taskId);
     const verifyStage = latestTask?.stages.find((stage) => stage.stage === 'verify-audio');
     if (!latestTask || !verifyStage) {
@@ -554,6 +579,8 @@ async function confirmAudio(
     ).bind(now, taskId),
   ]);
 
+  await ensureDefaultAudioRetention(env, asset.id, now);
+
   const started = await ensureCaptureWorkflowStarted(
     env,
     taskId,
@@ -568,37 +595,12 @@ async function confirmAudio(
   return json({ ok: true, data: { task: await readTask(env, taskId) }, requestId });
 }
 
-export class ShiyanCaptureWorkflow extends WorkflowEntrypoint<Env, { taskId: string; objectKey: string; requestId: string }> {
-  async run(event: { payload: { taskId: string; objectKey: string } }, step: { do<T>(name: string, callback: () => Promise<T>): Promise<T> }) {
-    const { taskId, objectKey } = event.payload;
-    await step.do('verify-audio', async () => {
-      const now = new Date().toISOString();
-      await this.env.DB.prepare(
-        `UPDATE capture_stages
-         SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
-         WHERE task_id = ? AND stage = 'verify-audio'`,
-      )
-        .bind(now, now, taskId)
-        .run();
-
-      const object = await this.env.AUDIO.head(objectKey);
-      if (!object) throw new Error('audio_object_missing');
-
-      const finishedAt = new Date().toISOString();
-      await this.env.DB.prepare(
-        `UPDATE capture_stages
-         SET status = 'succeeded', retryable = 0, error_code = NULL, error_message = NULL,
-             finished_at = ?, updated_at = ?
-         WHERE task_id = ? AND stage = 'verify-audio'`,
-      )
-        .bind(finishedAt, finishedAt, taskId)
-        .run();
-      return { taskId };
-    });
-
-    // MOB-018 intentionally stops here. MOB-019 owns transcription and the next
-    // Workflow stages. The Task remains active and truthfully points at the last
-    // implemented stage instead of pretending that STT/LLM already completed.
+export class ShiyanCaptureWorkflow extends WorkflowEntrypoint<Env, Mob019WorkflowPayload> {
+  async run(
+    event: { payload: Mob019WorkflowPayload },
+    step: Mob019WorkflowStep,
+  ): Promise<void> {
+    await runMob019Workflow(this.env, event.payload, step);
   }
 }
 
@@ -638,6 +640,17 @@ export default {
       return confirmAudio(request, env, device, taskId, requestId);
     }
 
+    const mob019Response = await handleMob019Request(request, env, device, requestId);
+    if (mob019Response) return mob019Response;
+
     return errorResponse(requestId, 404, 'route_not_found', 'Route not found');
+  },
+
+  async scheduled(
+    _controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<void> {
+    ctx.waitUntil(cleanupExpiredAudio(env));
   },
 };

@@ -8,6 +8,12 @@
     "R2_BUCKET_NAME": "mira-shiyan-audio",
     "UPLOAD_TTL_SECONDS": "900"
   },
+  "ai": {
+    "binding": "AI"
+  },
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
   "d1_databases": [
     {
       "binding": "DB",
