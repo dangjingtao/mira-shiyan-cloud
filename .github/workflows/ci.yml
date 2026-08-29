@@ -20,8 +20,8 @@ jobs:
         run: npx --yes wrangler@4.79.0 types worker-configuration.d.ts -c wrangler.api.jsonc
       - name: Typecheck
         run: npx --yes -p typescript@5.9.2 tsc -p tsconfig.json
-      - name: MOB-019 STT and Workflow tests
-        run: npx --yes tsx@4.20.5 --test tests/stt.test.ts tests/mob019.workflow.test.ts
+      - name: Shiyan workflow and destination tests
+        run: npx --yes tsx@4.20.5 --test tests/stt.test.ts tests/mob019.workflow.test.ts tests/mob022.destination.test.ts
       - name: Dry-run public API Worker
         run: npx --yes wrangler@4.79.0 deploy --dry-run -c wrangler.api.jsonc
       - name: Dry-run private LLM Worker
@@ -31,6 +31,8 @@ jobs:
           sqlite3 /tmp/shiyan.db < migrations/0001_capture_foundation.sql
           sqlite3 /tmp/shiyan.db < migrations/0001_capture_foundation.sql
           sqlite3 /tmp/shiyan.db < migrations/0002_stt_transcript.sql
+          sqlite3 /tmp/shiyan.db < migrations/0004_delivery_records.sql
           sqlite3 /tmp/shiyan.db '.schema transcripts'
           sqlite3 /tmp/shiyan.db '.schema transcript_segments'
+          sqlite3 /tmp/shiyan.db '.schema delivery_records'
           sqlite3 /tmp/shiyan.db 'PRAGMA table_info(audio_assets);'
