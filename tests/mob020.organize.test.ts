@@ -91,6 +91,7 @@ class FakeStatement {
 
 class FakeDb {
   readonly statements: Array<{ sql: string; values: unknown[] }> = [];
+  readonly reads: Array<{ sql: string; values: unknown[] }> = [];
   readonly tasks = new Map<
     string,
     {
@@ -144,6 +145,8 @@ class FakeDb {
   }
 
   first(sql: string, values: unknown[]): unknown {
+    this.reads.push({ sql, values: [...values] });
+
     if (sql.includes('FROM capture_tasks') && sql.includes('device_id = ?')) {
       const [taskId, deviceId] = values as [string, string];
       const task = this.tasks.get(taskId);
@@ -214,6 +217,7 @@ class FakeDb {
   }
 
   all(sql: string, values: unknown[]): unknown[] {
+    this.reads.push({ sql, values: [...values] });
     if (sql.includes('FROM scenes')) {
       const deviceId = values[0] as string;
       return [...this.scenes.values()].filter(
@@ -282,22 +286,22 @@ class FakeDb {
         base_version: (values[4] as number | null) ?? null,
         instruction: (values[5] as string | null) ?? null,
         idempotency_key: (values[6] as string | null) ?? null,
-        title: (values[7] as string | null) ?? null,
-        markdown: values[8] as string,
-        structured_json: values[9] as string,
-        scene_id: values[10] as string,
-        provider: values[11] as string,
-        model: values[12] as string,
-        latency_ms: values[13] as number,
-        prompt_tokens: (values[14] as number | null) ?? null,
-        completion_tokens: (values[15] as number | null) ?? null,
-        total_tokens: (values[16] as number | null) ?? null,
-        provider_request_id: (values[17] as string | null) ?? null,
-        fallback_used: values[18] as number,
-        correlation_id: values[19] as string,
-        confirmed_at: (values[20] as string | null) ?? null,
-        created_at: values[21] as string,
-        updated_at: values[22] as string,
+        title: null,
+        markdown: values[7] as string,
+        structured_json: values[8] as string,
+        scene_id: values[9] as string,
+        provider: values[10] as string,
+        model: values[11] as string,
+        latency_ms: values[12] as number,
+        prompt_tokens: (values[13] as number | null) ?? null,
+        completion_tokens: (values[14] as number | null) ?? null,
+        total_tokens: (values[15] as number | null) ?? null,
+        provider_request_id: (values[16] as string | null) ?? null,
+        fallback_used: values[17] as number,
+        correlation_id: values[18] as string,
+        confirmed_at: null,
+        created_at: values[19] as string,
+        updated_at: values[20] as string,
       };
       const exists = this.drafts.some(
         (candidate) =>
@@ -347,7 +351,8 @@ class FakeDb {
     }
 
     if (sql.includes('UPDATE capture_stages')) {
-      const stage = values.at(-1) as string;
+      const literalStage = /stage = '([a-z-]+)'/u.exec(sql)?.[1];
+      const stage = literalStage ?? (values.at(-1) as string);
       const previous = this.stages.get(stage);
       if (sql.includes("SET status = 'failed'")) {
         this.stages.set(stage, {
@@ -646,7 +651,7 @@ test('Organize retry endpoint restarts the workflow without re-running STT', asy
   assert.equal(workflowCreates[0].id, `capture-${TASK_ID}-organize-1`);
   assert.equal(workflowCreates[0].params?.startStage, 'organize');
   assert.equal(
-    db.statements.some(({ sql }) => sql.includes('FROM transcripts')),
+    db.reads.some(({ sql }) => sql.includes('FROM transcripts')),
     true,
   );
   assert.equal(

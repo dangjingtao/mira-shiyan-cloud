@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "mira-shiyan-api",
-  "main": "src/api/index.ts",
+  "main": "src/api/mob023.ts",
   "compatibility_date": "2026-08-29",
   "observability": { "enabled": true },
   "vars": {

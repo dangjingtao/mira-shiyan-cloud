@@ -1,5 +1,7 @@
 import type { SceneSpec, StructuredOrganization } from './scenes';
 
+export type { SceneSectionSpec, SceneSpec, StructuredOrganization } from './scenes';
+
 export type LlmFailureCode =
   | 'provider_error'
   | 'rate_limited'
