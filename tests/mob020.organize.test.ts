@@ -91,6 +91,7 @@ class FakeStatement {
 
 class FakeDb {
   readonly statements: Array<{ sql: string; values: unknown[] }> = [];
+  readonly reads: Array<{ sql: string; values: unknown[] }> = [];
   readonly tasks = new Map<
     string,
     {
@@ -144,6 +145,8 @@ class FakeDb {
   }
 
   first(sql: string, values: unknown[]): unknown {
+    this.reads.push({ sql, values: [...values] });
+
     if (sql.includes('FROM capture_tasks') && sql.includes('device_id = ?')) {
       const [taskId, deviceId] = values as [string, string];
       const task = this.tasks.get(taskId);
@@ -214,6 +217,7 @@ class FakeDb {
   }
 
   all(sql: string, values: unknown[]): unknown[] {
+    this.reads.push({ sql, values: [...values] });
     if (sql.includes('FROM scenes')) {
       const deviceId = values[0] as string;
       return [...this.scenes.values()].filter(
@@ -647,7 +651,7 @@ test('Organize retry endpoint restarts the workflow without re-running STT', asy
   assert.equal(workflowCreates[0].id, `capture-${TASK_ID}-organize-1`);
   assert.equal(workflowCreates[0].params?.startStage, 'organize');
   assert.equal(
-    db.statements.some(({ sql }) => sql.includes('FROM transcripts')),
+    db.reads.some(({ sql }) => sql.includes('FROM transcripts')),
     true,
   );
   assert.equal(
