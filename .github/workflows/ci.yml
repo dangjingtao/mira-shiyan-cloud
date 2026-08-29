@@ -20,12 +20,17 @@ jobs:
         run: npx --yes wrangler@4.79.0 types worker-configuration.d.ts -c wrangler.api.jsonc
       - name: Typecheck
         run: npx --yes -p typescript@5.9.2 tsc -p tsconfig.json
+      - name: STT provider and stage tests
+        run: npx --yes tsx@4.20.5 --test tests/stt.test.ts
       - name: Dry-run public API Worker
         run: npx --yes wrangler@4.79.0 deploy --dry-run -c wrangler.api.jsonc
       - name: Dry-run private LLM Worker
         run: npx --yes wrangler@4.79.0 deploy --dry-run -c wrangler.llm.jsonc
-      - name: Verify D1 migration is repeatable
+      - name: Verify D1 migrations
         run: |
           sqlite3 /tmp/shiyan.db < migrations/0001_capture_foundation.sql
           sqlite3 /tmp/shiyan.db < migrations/0001_capture_foundation.sql
-          sqlite3 /tmp/shiyan.db '.schema'
+          sqlite3 /tmp/shiyan.db < migrations/0002_stt_transcript.sql
+          sqlite3 /tmp/shiyan.db '.schema transcripts'
+          sqlite3 /tmp/shiyan.db '.schema transcript_segments'
+          sqlite3 /tmp/shiyan.db 'PRAGMA table_info(audio_assets);'
