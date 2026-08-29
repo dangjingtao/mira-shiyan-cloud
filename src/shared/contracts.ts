@@ -70,3 +70,37 @@ export interface CaptureTaskView {
   updatedAt: string;
   stages: CaptureStageView[];
 }
+
+export interface TranscriptSegmentView {
+  startMs: number;
+  endMs: number;
+  text: string;
+}
+
+export interface TranscriptView {
+  id: string;
+  taskId: string;
+  sourceAssetId: string;
+  text: string;
+  language: string | null;
+  durationMs: number | null;
+  segments: TranscriptSegmentView[];
+  provider: string;
+  model: string;
+  providerRequestId: string | null;
+  providerMetadata: Record<string, string | number | boolean | null>;
+  createdAt: string;
+}
+
+export interface AudioRetentionView {
+  assetId: string;
+  retained: boolean;
+  deleteAfter: string | null;
+  deletedAt: string | null;
+}
+
+export interface SttRetryView {
+  taskId: string;
+  stage: 'transcribe';
+  retryCount: number;
+}
