@@ -10,12 +10,13 @@ const sha256Hex = async (value: string): Promise<string> =>
   toHex(await crypto.subtle.digest('SHA-256', encoder.encode(value)));
 
 const hmac = async (
-  key: ArrayBuffer | Uint8Array,
+  key: ArrayBuffer | Uint8Array<ArrayBuffer>,
   value: string,
 ): Promise<ArrayBuffer> => {
+  const rawKey = key instanceof ArrayBuffer ? key : new Uint8Array(key).buffer;
   const cryptoKey = await crypto.subtle.importKey(
     'raw',
-    key,
+    rawKey,
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign'],
