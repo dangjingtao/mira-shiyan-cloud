@@ -315,15 +315,31 @@ export async function executeDestinationDelivery(
   } else {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
-    await env.DB.prepare(
-      `INSERT INTO delivery_records
-       (id, task_id, final_draft_id, destination, idempotency_key, status, retryable,
-        retry_count, content_sha256, created_at, updated_at)
-       VALUES (?, ?, ?, 'github', ?, 'pending', 1, 0, ?, ?, ?)`,
-    )
-      .bind(id, draft.taskId, draft.id, key, contentSha, now, now)
-      .run();
-    row = await readDeliveryById(env, id);
+    try {
+      await env.DB.prepare(
+        `INSERT INTO delivery_records
+         (id, task_id, final_draft_id, destination, idempotency_key, status, retryable,
+          retry_count, content_sha256, created_at, updated_at)
+         VALUES (?, ?, ?, 'github', ?, 'pending', 1, 0, ?, ?, ?)`,
+      )
+        .bind(id, draft.taskId, draft.id, key, contentSha, now, now)
+        .run();
+      row = await readDeliveryById(env, id);
+    } catch {
+      const winner = await readDeliveryByKey(env, draft.taskId, key);
+      if (!winner) {
+        return {
+          ok: false,
+          record: null,
+          error: {
+            kind: 'retryable',
+            code: 'delivery_record_persist_failed',
+            message: 'Delivery record could not be persisted',
+          },
+        };
+      }
+      return executeDestinationDelivery(env, adapter, draft, key);
+    }
   }
 
   if (!row) {
