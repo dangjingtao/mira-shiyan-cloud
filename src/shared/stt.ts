@@ -13,6 +13,8 @@ export type TranscriptSegment = {
   text: string;
 };
 
+export type SttProviderMetadata = Record<string, string | number | boolean | null>;
+
 export type SttSuccess = {
   text: string;
   language?: string;
@@ -21,6 +23,7 @@ export type SttSuccess = {
   provider: string;
   model: string;
   providerRequestId?: string;
+  providerMetadata?: SttProviderMetadata;
 };
 
 export type SttFailure = {
