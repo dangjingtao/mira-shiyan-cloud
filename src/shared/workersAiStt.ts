@@ -2,7 +2,7 @@ import type { SttProvider, SttRequest, SttResult, TranscriptSegment } from './st
 
 const MODEL = '@cf/openai/whisper-large-v3-turbo';
 
-type WorkersAiLike = {
+export type WorkersAiLike = {
   run(model: string, input: Record<string, unknown>): Promise<unknown>;
 };
 
@@ -18,7 +18,9 @@ type WhisperResponse = {
   text?: string;
   transcription_info?: {
     text?: string;
+    word_count?: number;
   };
+  word_count?: number;
   language?: string;
   segments?: WhisperSegment[];
   request_id?: string;
@@ -45,14 +47,35 @@ const normalizeSegments = (segments: WhisperSegment[] | undefined): TranscriptSe
   return normalized.length ? normalized : undefined;
 };
 
-const providerFailure = (error: unknown): SttResult => {
-  const message = error instanceof Error ? error.message : 'Workers AI transcription failed';
-  const retryable = /\b(408|429|5\d\d)\b|timeout|temporar|unavailable|rate.?limit/iu.test(message);
+const errorMessage = (error: unknown, fallback: string): string =>
+  error instanceof Error ? error.message : fallback;
+
+const isRetryableMessage = (message: string): boolean =>
+  /\b(408|425|429|5\d\d)\b|timeout|timed out|temporar|unavailable|rate.?limit|connection|network/iu.test(
+    message,
+  );
+
+export const providerFailure = (error: unknown): SttResult => {
+  const message = errorMessage(error, 'Workers AI transcription failed');
+  const retryable = isRetryableMessage(message);
   return {
     ok: false,
     error: {
       kind: retryable ? 'retryable' : 'terminal',
       code: retryable ? 'stt_provider_retryable' : 'stt_provider_error',
+      message,
+    },
+  };
+};
+
+const audioLoadFailure = (error: unknown): SttResult => {
+  const message = errorMessage(error, 'Audio asset could not be read');
+  const retryable = isRetryableMessage(message);
+  return {
+    ok: false,
+    error: {
+      kind: retryable ? 'retryable' : 'terminal',
+      code: retryable ? 'audio_asset_read_retryable' : 'audio_asset_unreadable',
       message,
     },
   };
@@ -69,14 +92,7 @@ export class WorkersAiSttProvider implements SttProvider {
     try {
       audio = await this.loadAudioBase64(request.audioObjectKey);
     } catch (error) {
-      return {
-        ok: false,
-        error: {
-          kind: 'terminal',
-          code: 'audio_asset_unreadable',
-          message: error instanceof Error ? error.message : 'Audio asset could not be read',
-        },
-      };
+      return audioLoadFailure(error);
     }
 
     try {
@@ -97,15 +113,19 @@ export class WorkersAiSttProvider implements SttProvider {
         };
       }
 
+      const segments = normalizeSegments(raw.segments);
+      const wordCount = raw.transcription_info?.word_count ?? raw.word_count;
+
       return {
         ok: true,
         value: {
           text,
           ...(raw.language ? { language: raw.language } : {}),
-          ...(normalizeSegments(raw.segments) ? { segments: normalizeSegments(raw.segments) } : {}),
+          ...(segments ? { segments } : {}),
           provider: 'cloudflare-workers-ai',
           model: MODEL,
           ...(raw.request_id ? { providerRequestId: raw.request_id } : {}),
+          ...(typeof wordCount === 'number' ? { providerMetadata: { wordCount } } : {}),
         },
       };
     } catch (error) {
