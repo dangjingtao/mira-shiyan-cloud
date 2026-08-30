@@ -21,28 +21,33 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
+          import re
 
           test_path = Path('tests/mob020.organize.test.ts')
           text = test_path.read_text()
-          old = """  assert.equal(
-            db.statements.some(({ sql }) => sql.includes('FROM transcripts')),
-            true,
-          );"""
-          new = """  // A successful retry already proves a persisted Transcript was available;
+          pattern = re.compile(
+              r"assert\.equal\(\s*db\.statements\.some\(\(\{ sql \}\) => sql\.includes\('FROM transcripts'\)\),\s*true,\s*\);",
+              re.MULTILINE,
+          )
+          replacement = """// A successful retry already proves a persisted Transcript was available;
           // separately assert that retry preserves that evidence and never restarts STT.
           assert.equal(db.transcript?.text, TRANSCRIPT_TEXT);"""
-          if old not in text:
-              raise SystemExit('Expected stale Transcript-read assertion not found')
-          test_path.write_text(text.replace(old, new, 1))
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'Expected one stale Transcript-read assertion; got {count}')
+          test_path.write_text(text)
 
           workflow_path = Path('.github/workflows/deploy-dev.yml')
           workflow = workflow_path.read_text()
-          marker = "      - 'migrations/**'\n"
-          addition = "      - 'migrations/**'\n      - 'tests/**'\n"
           if "      - 'tests/**'\n" not in workflow:
-              if marker not in workflow:
-                  raise SystemExit('Deploy workflow path marker not found')
-              workflow = workflow.replace(marker, addition, 1)
+              workflow, count = re.subn(
+                  r"(?m)^(\s+- 'migrations/\*\*')\s*$",
+                  r"\1\n      - 'tests/**'",
+                  workflow,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit(f'Expected one deploy workflow migrations path; got {count}')
               workflow_path.write_text(workflow)
 
       - name: Commit repair
