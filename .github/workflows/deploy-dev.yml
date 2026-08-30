@@ -38,8 +38,7 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Validate GitHub deployment inputs
-        id: github-inputs
+      - name: Validate Cloudflare query credentials
         shell: bash
         run: |
           set -uo pipefail
@@ -59,38 +58,19 @@ jobs:
 
           require_value 'GitHub secret' 'CLOUDFLARE_API_TOKEN' "${CLOUDFLARE_API_TOKEN:-}"
           require_value 'GitHub secret' 'CLOUDFLARE_ACCOUNT_ID' "${CLOUDFLARE_ACCOUNT_ID:-}"
-          require_value 'GitHub repository/environment variable' 'SHIYAN_D1_DATABASE_ID' "${SHIYAN_D1_DATABASE_ID:-}"
+          exit "$missing"
 
-          if [ "$missing" -ne 0 ]; then
-            echo 'Cloudflare-side secret/resource validation cannot run until the deployment inputs above exist.'
-            exit 1
-          fi
-
-      - name: Build effective API Wrangler config for preflight
+      - name: Build minimal API config for secret inspection
         shell: bash
         run: |
-          set -euo pipefail
-          cp wrangler.api.jsonc wrangler.api.preflight.jsonc
-          node <<'NODE'
-          const fs = require('node:fs');
-          const path = 'wrangler.api.preflight.jsonc';
-          let text = fs.readFileSync(path, 'utf8');
-
-          if (!text.includes('REPLACE_WITH_D1_DATABASE_ID')) {
-            throw new Error('wrangler.api.jsonc no longer contains the expected D1 placeholder; update workflow intentionally');
+          cat > wrangler.api.preflight.jsonc <<'EOF'
+          {
+            "$schema": "node_modules/wrangler/config-schema.json",
+            "name": "mira-shiyan-api",
+            "main": "src/api/index.ts",
+            "compatibility_date": "2026-08-29"
           }
-
-          text = text.replace('REPLACE_WITH_D1_DATABASE_ID', process.env.SHIYAN_D1_DATABASE_ID);
-
-          if (!text.includes('"R2_ACCOUNT_ID"')) {
-            text = text.replace(
-              '"R2_BUCKET_NAME": "mira-shiyan-audio",',
-              `"R2_BUCKET_NAME": "mira-shiyan-audio",\n    "R2_ACCOUNT_ID": "${process.env.CLOUDFLARE_ACCOUNT_ID}",`,
-            );
-          }
-
-          fs.writeFileSync(path, text);
-          NODE
+          EOF
 
       - name: Verify Cloudflare runtime secrets
         shell: bash
@@ -132,11 +112,38 @@ jobs:
 
           exit "$missing"
 
-      - name: Verify Cloudflare D1 database is reachable
+      - name: Validate D1 deployment input
+        shell: bash
+        run: |
+          if [ -z "${SHIYAN_D1_DATABASE_ID:-}" ]; then
+            echo '::error::Missing GitHub repository/environment variable: SHIYAN_D1_DATABASE_ID'
+            exit 1
+          fi
+          echo 'Found GitHub repository/environment variable: SHIYAN_D1_DATABASE_ID'
+
+      - name: Build effective API Wrangler config for D1 inspection
+        if: ${{ vars.SHIYAN_D1_DATABASE_ID != '' }}
         shell: bash
         run: |
           set -euo pipefail
-          npx --yes wrangler@${WRANGLER_VERSION} d1 info mira-shiyan -c wrangler.api.preflight.jsonc >/dev/null
+          cp wrangler.api.jsonc wrangler.api.d1-preflight.jsonc
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = 'wrangler.api.d1-preflight.jsonc';
+          let text = fs.readFileSync(path, 'utf8');
+          if (!text.includes('REPLACE_WITH_D1_DATABASE_ID')) {
+            throw new Error('wrangler.api.jsonc no longer contains the expected D1 placeholder; update workflow intentionally');
+          }
+          text = text.replace('REPLACE_WITH_D1_DATABASE_ID', process.env.SHIYAN_D1_DATABASE_ID);
+          fs.writeFileSync(path, text);
+          NODE
+
+      - name: Verify Cloudflare D1 database is reachable
+        if: ${{ vars.SHIYAN_D1_DATABASE_ID != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@${WRANGLER_VERSION} d1 info mira-shiyan -c wrangler.api.d1-preflight.jsonc >/dev/null
           echo 'Cloudflare D1 reachable: mira-shiyan'
 
   validate:
