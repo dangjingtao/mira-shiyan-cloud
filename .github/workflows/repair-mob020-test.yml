@@ -17,14 +17,14 @@ jobs:
         with:
           ref: dev
 
-      - name: Finish test harness repair and CI trigger coverage
+      - name: Finish stale retry assertion repair
         shell: python
         run: |
           from pathlib import Path
           import re
 
-          test_path = Path('tests/mob020.organize.test.ts')
-          text = test_path.read_text()
+          path = Path('tests/mob020.organize.test.ts')
+          text = path.read_text()
           pattern = re.compile(
               r"assert\.equal\(\s*db\.statements\.some\(\(\{ sql \}\) => sql\.includes\('FROM transcripts'\)\),\s*true,\s*\);",
               re.MULTILINE,
@@ -35,29 +35,15 @@ jobs:
           text, count = pattern.subn(replacement, text, count=1)
           if count != 1:
               raise SystemExit(f'Expected one stale Transcript-read assertion; got {count}')
-          test_path.write_text(text)
-
-          workflow_path = Path('.github/workflows/deploy-dev.yml')
-          workflow = workflow_path.read_text()
-          if "      - 'tests/**'\n" not in workflow:
-              workflow, count = re.subn(
-                  r"(?m)^(\s+- 'migrations/\*\*')\s*$",
-                  r"\1\n      - 'tests/**'",
-                  workflow,
-                  count=1,
-              )
-              if count != 1:
-                  raise SystemExit(f'Expected one deploy workflow migrations path; got {count}')
-              workflow_path.write_text(workflow)
+          path.write_text(text)
 
       - name: Commit repair
         shell: bash
         run: |
           set -euo pipefail
           git diff --check
-          git diff --exit-code && { echo 'No repair needed'; exit 0; }
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add tests/mob020.organize.test.ts .github/workflows/deploy-dev.yml
+          git add tests/mob020.organize.test.ts
           git commit -m 'test: finish MOB-020 harness alignment'
           git push origin HEAD:dev
