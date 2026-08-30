@@ -148,10 +148,8 @@ export class OpenAiCompatibleChatProvider {
     try {
       const result = await generateText({
         model: provider.chatModel(this.config.model),
-        messages: [
-          { role: 'system', content: input.systemPrompt },
-          { role: 'user', content: input.userPrompt },
-        ],
+        system: input.systemPrompt,
+        prompt: input.userPrompt,
         temperature: 0.2,
         // ShiyanLlmGateway owns failover. Disable SDK retries so one provider
         // attempt cannot silently multiply requests before fallback begins.
@@ -198,6 +196,19 @@ export class OpenAiCompatibleChatProvider {
           : {}),
       };
     } catch (error) {
+      // A malformed HTTP-200 provider response is a provider-output contract
+      // failure, not an invalid Shiyan request. AI SDK can attach statusCode=200
+      // to its parse/validation error, so classify payload failures first.
+      if (isInvalidProviderPayload(error)) {
+        return {
+          ok: false,
+          error: {
+            kind: 'terminal',
+            code: 'invalid_response',
+            message: `${this.config.provider} returned an invalid OpenAI-compatible response`,
+          },
+        };
+      }
       const status = statusCodeFrom(error);
       if (status !== null) {
         return { ok: false, error: this.httpFailure(status) };
@@ -209,16 +220,6 @@ export class OpenAiCompatibleChatProvider {
             kind: 'retryable',
             code: 'timeout',
             message: `${this.config.provider} request timed out after ${this.config.timeoutMs}ms`,
-          },
-        };
-      }
-      if (isInvalidProviderPayload(error)) {
-        return {
-          ok: false,
-          error: {
-            kind: 'terminal',
-            code: 'invalid_response',
-            message: `${this.config.provider} returned an invalid OpenAI-compatible response`,
           },
         };
       }
