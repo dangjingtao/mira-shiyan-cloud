@@ -107,9 +107,10 @@ jobs:
             done
           }
 
+          # One primary OpenAI-compatible provider is sufficient. Fallback is
+          # optional and is used automatically when its full slot is configured.
           check_worker_secrets wrangler.llm.jsonc \
-            LLM_PRIMARY_API_KEY \
-            LLM_FALLBACK_API_KEY
+            LLM_PRIMARY_API_KEY
 
           check_worker_secrets wrangler.api.preflight.jsonc \
             R2_ACCESS_KEY_ID \
@@ -283,8 +284,7 @@ jobs:
           }
 
           require_worker_secrets wrangler.llm.jsonc \
-            LLM_PRIMARY_API_KEY \
-            LLM_FALLBACK_API_KEY
+            LLM_PRIMARY_API_KEY
 
           require_worker_secrets wrangler.api.deploy.jsonc \
             R2_ACCESS_KEY_ID \
