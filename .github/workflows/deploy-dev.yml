@@ -1,0 +1,208 @@
+name: Shiyan Cloud Dev Deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - 'src/**'
+      - 'migrations/**'
+      - 'wrangler.api.jsonc'
+      - 'wrangler.llm.jsonc'
+      - '.github/workflows/deploy-dev.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shiyan-cloud-dev-deploy
+  cancel-in-progress: false
+
+env:
+  WRANGLER_VERSION: '4.79.0'
+
+jobs:
+  validate:
+    name: Validate Shiyan cloud contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Generate Cloudflare runtime and binding types
+        run: npx --yes wrangler@${WRANGLER_VERSION} types worker-configuration.d.ts -c wrangler.api.jsonc
+
+      - name: Typecheck
+        run: npx --yes -p typescript@5.9.2 tsc -p tsconfig.json
+
+      - name: Run Shiyan workflow and destination tests
+        run: >-
+          npx --yes tsx@4.20.5 --test
+          tests/stt.test.ts
+          tests/mob019.workflow.test.ts
+          tests/mob020.llm.test.ts
+          tests/mob020.organize.test.ts
+          tests/mob022.destination.test.ts
+          tests/mob022.delivery.test.ts
+
+      - name: Dry-run public API Worker
+        run: npx --yes wrangler@${WRANGLER_VERSION} deploy --dry-run -c wrangler.api.jsonc
+
+      - name: Dry-run private LLM Worker
+        run: npx --yes wrangler@${WRANGLER_VERSION} deploy --dry-run -c wrangler.llm.jsonc
+
+      - name: Verify D1 migrations locally
+        run: |
+          set -euo pipefail
+          sqlite3 /tmp/shiyan.db < migrations/0001_capture_foundation.sql
+          sqlite3 /tmp/shiyan.db < migrations/0001_capture_foundation.sql
+          sqlite3 /tmp/shiyan.db < migrations/0002_stt_transcript.sql
+          sqlite3 /tmp/shiyan.db < migrations/0004_delivery_records.sql
+          sqlite3 /tmp/shiyan.db < migrations/0005_llm_organization.sql
+          sqlite3 /tmp/shiyan.db < migrations/0005_llm_organization.sql
+          sqlite3 /tmp/shiyan.db '.schema transcripts'
+          sqlite3 /tmp/shiyan.db '.schema transcript_segments'
+          sqlite3 /tmp/shiyan.db '.schema delivery_records'
+          sqlite3 /tmp/shiyan.db '.schema drafts'
+          sqlite3 /tmp/shiyan.db '.schema scenes'
+          sqlite3 /tmp/shiyan.db 'PRAGMA table_info(audio_assets);'
+
+  deploy:
+    name: Deploy dev to Cloudflare
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: shiyan-dev
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SHIYAN_D1_DATABASE_ID: ${{ vars.SHIYAN_D1_DATABASE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate deploy configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${CLOUDFLARE_API_TOKEN:-}" || { echo 'Missing GitHub secret: CLOUDFLARE_API_TOKEN'; exit 1; }
+          test -n "${CLOUDFLARE_ACCOUNT_ID:-}" || { echo 'Missing GitHub secret: CLOUDFLARE_ACCOUNT_ID'; exit 1; }
+          test -n "${SHIYAN_D1_DATABASE_ID:-}" || { echo 'Missing GitHub repository variable: SHIYAN_D1_DATABASE_ID'; exit 1; }
+
+      - name: Build effective API Wrangler config
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp wrangler.api.jsonc wrangler.api.deploy.jsonc
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = 'wrangler.api.deploy.jsonc';
+          let text = fs.readFileSync(path, 'utf8');
+
+          if (!text.includes('REPLACE_WITH_D1_DATABASE_ID')) {
+            throw new Error('wrangler.api.jsonc no longer contains the expected D1 placeholder; update deploy workflow intentionally');
+          }
+
+          text = text.replace(
+            'REPLACE_WITH_D1_DATABASE_ID',
+            process.env.SHIYAN_D1_DATABASE_ID,
+          );
+
+          if (!text.includes('"R2_ACCOUNT_ID"')) {
+            text = text.replace(
+              '"R2_BUCKET_NAME": "mira-shiyan-audio",',
+              `"R2_BUCKET_NAME": "mira-shiyan-audio",\n    "R2_ACCOUNT_ID": "${process.env.CLOUDFLARE_ACCOUNT_ID}",`,
+            );
+          }
+
+          fs.writeFileSync(path, text);
+          NODE
+
+      - name: Check existing Cloudflare runtime secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_worker_secrets() {
+            local config="$1"
+            shift
+            local output
+
+            if ! output="$(npx --yes wrangler@${WRANGLER_VERSION} secret list -c "$config" 2>&1)"; then
+              echo "::warning::Could not list secrets for $config before deploy. The Worker may not exist yet; required secrets will be checked again after deploy."
+              return 0
+            fi
+
+            local missing=0
+            for name in "$@"; do
+              if ! grep -Eq "\"name\"[[:space:]]*:[[:space:]]*\"${name}\"" <<<"$output"; then
+                echo "::error::Missing Cloudflare runtime secret for $config: $name"
+                missing=1
+              fi
+            done
+            return "$missing"
+          }
+
+          check_worker_secrets wrangler.llm.jsonc \
+            LLM_PRIMARY_API_KEY \
+            LLM_FALLBACK_API_KEY
+
+          check_worker_secrets wrangler.api.deploy.jsonc \
+            R2_ACCESS_KEY_ID \
+            R2_SECRET_ACCESS_KEY \
+            DEVICE_AUTH_PEPPER \
+            GITHUB_DESTINATION_TOKEN
+
+      - name: Deploy private LLM Worker first
+        run: npx --yes wrangler@${WRANGLER_VERSION} deploy -c wrangler.llm.jsonc
+
+      - name: Apply remote D1 migrations
+        run: npx --yes wrangler@${WRANGLER_VERSION} d1 migrations apply mira-shiyan --remote -c wrangler.api.deploy.jsonc
+
+      - name: Deploy public API Worker and Workflow
+        run: npx --yes wrangler@${WRANGLER_VERSION} deploy -c wrangler.api.deploy.jsonc
+
+      - name: Verify required Cloudflare runtime secrets after deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          require_worker_secrets() {
+            local config="$1"
+            shift
+            local output
+            output="$(npx --yes wrangler@${WRANGLER_VERSION} secret list -c "$config")"
+
+            local missing=0
+            for name in "$@"; do
+              if ! grep -Eq "\"name\"[[:space:]]*:[[:space:]]*\"${name}\"" <<<"$output"; then
+                echo "::error::Missing Cloudflare runtime secret for $config: $name"
+                missing=1
+              fi
+            done
+            test "$missing" -eq 0
+          }
+
+          require_worker_secrets wrangler.llm.jsonc \
+            LLM_PRIMARY_API_KEY \
+            LLM_FALLBACK_API_KEY
+
+          require_worker_secrets wrangler.api.deploy.jsonc \
+            R2_ACCESS_KEY_ID \
+            R2_SECRET_ACCESS_KEY \
+            DEVICE_AUTH_PEPPER \
+            GITHUB_DESTINATION_TOKEN
+
+      - name: Show deployed versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@${WRANGLER_VERSION} deployments list -c wrangler.llm.jsonc
+          npx --yes wrangler@${WRANGLER_VERSION} deployments list -c wrangler.api.deploy.jsonc
