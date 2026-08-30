@@ -54,13 +54,14 @@ const resolveSlot = (
   env: LlmEnvLike,
   role: 'PRIMARY' | 'FALLBACK',
 ): LlmProviderSlot | null => {
-  const provider = env[`LLM_${role}_PROVIDER`]?.trim();
+  const provider = env[`LLM_${role}_PROVIDER`]?.trim() || role.toLowerCase();
   const baseUrl = env[`LLM_${role}_BASE_URL`]?.trim();
   const model = env[`LLM_${role}_MODEL`]?.trim();
   const apiKey = env[`LLM_${role}_API_KEY`]?.trim();
-  // A slot without a key is simply an unavailable provider, not an error: the
-  // other slot may still serve the request.
-  if (!provider || !baseUrl || !model || !apiKey) return null;
+
+  // Provider is only an observability label. A usable OpenAI-compatible slot
+  // needs endpoint + model + key; fallback may be left entirely unconfigured.
+  if (!baseUrl || !model || !apiKey) return null;
   return { provider, baseUrl, model, apiKey };
 };
 
@@ -163,7 +164,7 @@ export class ShiyanLlmGateway {
         error: {
           kind: 'retryable',
           code: 'not_configured',
-          message: 'no LLM provider is configured with an API key',
+          message: 'no LLM provider is configured with base URL, model and API key',
         },
       };
     }
@@ -240,7 +241,7 @@ export class ShiyanLlmGateway {
 
     return {
       ok: false,
-      error: {
+      error: lastError ?? {
         kind: 'retryable',
         code: 'provider_error',
         message: 'all configured LLM providers failed with retryable errors',
