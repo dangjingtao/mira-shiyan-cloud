@@ -1,0 +1,119 @@
+name: Repair MOB-020 Test Harness
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/repair-mob020-test.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      - name: Repair stale FakeDb SQL mappings
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('tests/mob020.organize.test.ts')
+          text = path.read_text()
+
+          old_draft = """      const draft: DraftRow = {
+                id: values[0] as string,
+                task_id: values[1] as string,
+                kind: 'ai',
+                version: values[2] as number,
+                source: values[3] as 'organize' | 'adjust',
+                base_version: (values[4] as number | null) ?? null,
+                instruction: (values[5] as string | null) ?? null,
+                idempotency_key: (values[6] as string | null) ?? null,
+                title: (values[7] as string | null) ?? null,
+                markdown: values[8] as string,
+                structured_json: values[9] as string,
+                scene_id: values[10] as string,
+                provider: values[11] as string,
+                model: values[12] as string,
+                latency_ms: values[13] as number,
+                prompt_tokens: (values[14] as number | null) ?? null,
+                completion_tokens: (values[15] as number | null) ?? null,
+                total_tokens: (values[16] as number | null) ?? null,
+                provider_request_id: (values[17] as string | null) ?? null,
+                fallback_used: values[18] as number,
+                correlation_id: values[19] as string,
+                confirmed_at: (values[20] as string | null) ?? null,
+                created_at: values[21] as string,
+                updated_at: values[22] as string,
+              };"""
+
+          new_draft = """      // AI Draft SQL uses literal NULL for `title` and `confirmed_at`, so
+              // those columns do not consume bind positions. Keep this harness aligned
+              // with the production INSERT contract instead of guessing by schema order.
+              const draft: DraftRow = {
+                id: values[0] as string,
+                task_id: values[1] as string,
+                kind: 'ai',
+                version: values[2] as number,
+                source: values[3] as 'organize' | 'adjust',
+                base_version: (values[4] as number | null) ?? null,
+                instruction: (values[5] as string | null) ?? null,
+                idempotency_key: (values[6] as string | null) ?? null,
+                title: null,
+                markdown: values[7] as string,
+                structured_json: values[8] as string,
+                scene_id: values[9] as string,
+                provider: values[10] as string,
+                model: values[11] as string,
+                latency_ms: values[12] as number,
+                prompt_tokens: (values[13] as number | null) ?? null,
+                completion_tokens: (values[14] as number | null) ?? null,
+                total_tokens: (values[15] as number | null) ?? null,
+                provider_request_id: (values[16] as string | null) ?? null,
+                fallback_used: values[17] as number,
+                correlation_id: values[18] as string,
+                confirmed_at: null,
+                created_at: values[19] as string,
+                updated_at: values[20] as string,
+              };"""
+
+          old_insert_stage = """    if (sql.includes('INSERT OR IGNORE INTO capture_stages')) {
+              const stage = values[1] as string;"""
+          new_insert_stage = """    if (sql.includes('INSERT OR IGNORE INTO capture_stages')) {
+              const hardcodedStage = /VALUES\\s*\\(\\?,\\s*'([^']+)'/u.exec(sql)?.[1];
+              const stage = hardcodedStage ?? (values[1] as string);"""
+
+          old_update_stage = """    if (sql.includes('UPDATE capture_stages')) {
+              const stage = values.at(-1) as string;"""
+          new_update_stage = """    if (sql.includes('UPDATE capture_stages')) {
+              const hardcodedStage = /stage\\s*=\\s*'([^']+)'/u.exec(sql)?.[1];
+              const stage = hardcodedStage ?? (values.at(-1) as string);"""
+
+          replacements = [
+              (old_draft, new_draft, 'AI Draft bind mapping'),
+              (old_insert_stage, new_insert_stage, 'capture stage INSERT mapping'),
+              (old_update_stage, new_update_stage, 'capture stage UPDATE mapping'),
+          ]
+          for old, new, label in replacements:
+              if old not in text:
+                  raise SystemExit(f'Expected block not found: {label}')
+              text = text.replace(old, new, 1)
+
+          path.write_text(text)
+
+      - name: Commit repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff --exit-code && { echo 'No repair needed'; exit 0; }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tests/mob020.organize.test.ts
+          git commit -m 'test: align MOB-020 FakeDb with SQL contract'
+          git push origin HEAD:dev
