@@ -241,7 +241,7 @@ export class ShiyanLlmGateway {
 
     return {
       ok: false,
-      error: lastError ?? {
+      error: {
         kind: 'retryable',
         code: 'provider_error',
         message: 'all configured LLM providers failed with retryable errors',
