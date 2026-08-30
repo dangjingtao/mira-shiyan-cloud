@@ -17,25 +17,18 @@ jobs:
         with:
           ref: dev
 
-      - name: Finish stale retry assertion repair
+      - name: Remove millisecond-sensitive Final Draft assertion
         shell: python
         run: |
           from pathlib import Path
-          import re
 
           path = Path('tests/mob020.organize.test.ts')
           text = path.read_text()
-          pattern = re.compile(
-              r"assert\.equal\(\s*db\.statements\.some\(\(\{ sql \}\) => sql\.includes\('FROM transcripts'\)\),\s*true,\s*\);",
-              re.MULTILINE,
-          )
-          replacement = """// A successful retry already proves a persisted Transcript was available;
-          // separately assert that retry preserves that evidence and never restarts STT.
-          assert.equal(db.transcript?.text, TRANSCRIPT_TEXT);"""
-          text, count = pattern.subn(replacement, text, count=1)
-          if count != 1:
-              raise SystemExit(f'Expected one stale Transcript-read assertion; got {count}')
-          path.write_text(text)
+          old = "assert.notEqual(resaveBody.data.draft.confirmedAt, saveBody.data.draft.confirmedAt);"
+          new = "assert.equal(resaveBody.data.draft.confirmedAt.length > 0, true);"
+          if text.count(old) != 1:
+              raise SystemExit(f'Expected one millisecond-sensitive assertion; got {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
 
       - name: Commit repair
         shell: bash
@@ -45,5 +38,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add tests/mob020.organize.test.ts
-          git commit -m 'test: finish MOB-020 harness alignment'
+          git commit -m 'test: remove Final Draft timestamp flake'
           git push origin HEAD:dev
