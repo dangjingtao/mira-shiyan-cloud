@@ -7,6 +7,8 @@ on:
     paths:
       - 'src/**'
       - 'migrations/**'
+      - 'package.json'
+      - 'package-lock.json'
       - 'wrangler.api.jsonc'
       - 'wrangler.llm.jsonc'
       - '.github/workflows/deploy-dev.yml'
@@ -84,6 +86,10 @@ jobs:
             local output
 
             if ! output="$(npx --yes wrangler@${WRANGLER_VERSION} secret list -c "$config" 2>&1)"; then
+              if grep -q 'Worker .* not found' <<<"$output"; then
+                echo "::warning::Worker for $config does not exist yet; secret inspection will run after bootstrap deploy."
+                return 0
+              fi
               echo "::error::Unable to query Cloudflare secrets for $config"
               echo "$output"
               missing=1
@@ -157,15 +163,18 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Install project dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+
       - name: Generate Cloudflare runtime and binding types
-        run: npx --yes wrangler@${WRANGLER_VERSION} types worker-configuration.d.ts -c wrangler.api.jsonc
+        run: npx wrangler types worker-configuration.d.ts -c wrangler.api.jsonc
 
       - name: Typecheck
-        run: npx --yes -p typescript@5.9.2 tsc -p tsconfig.json
+        run: npx tsc -p tsconfig.json
 
       - name: Run Shiyan workflow and destination tests
         run: >-
-          npx --yes tsx@4.20.5 --test
+          npx tsx --test
           tests/stt.test.ts
           tests/mob019.workflow.test.ts
           tests/mob020.llm.test.ts
@@ -174,10 +183,10 @@ jobs:
           tests/mob022.delivery.test.ts
 
       - name: Dry-run public API Worker
-        run: npx --yes wrangler@${WRANGLER_VERSION} deploy --dry-run -c wrangler.api.jsonc
+        run: npx wrangler deploy --dry-run -c wrangler.api.jsonc
 
       - name: Dry-run private LLM Worker
-        run: npx --yes wrangler@${WRANGLER_VERSION} deploy --dry-run -c wrangler.llm.jsonc
+        run: npx wrangler deploy --dry-run -c wrangler.llm.jsonc
 
       - name: Verify D1 migrations locally
         run: |
@@ -212,6 +221,9 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Install project dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+
       - name: Build effective API Wrangler config
         shell: bash
         run: |
@@ -239,17 +251,51 @@ jobs:
           NODE
 
       - name: Deploy private LLM Worker first
-        run: npx --yes wrangler@${WRANGLER_VERSION} deploy -c wrangler.llm.jsonc
+        run: npx wrangler deploy -c wrangler.llm.jsonc
 
       - name: Apply remote D1 migrations
-        run: npx --yes wrangler@${WRANGLER_VERSION} d1 migrations apply mira-shiyan --remote -c wrangler.api.deploy.jsonc
+        run: npx wrangler d1 migrations apply mira-shiyan --remote -c wrangler.api.deploy.jsonc
 
       - name: Deploy public API Worker and Workflow
-        run: npx --yes wrangler@${WRANGLER_VERSION} deploy -c wrangler.api.deploy.jsonc
+        run: npx wrangler deploy -c wrangler.api.deploy.jsonc
+
+      - name: Verify required Cloudflare runtime secrets after deploy
+        shell: bash
+        run: |
+          set -uo pipefail
+          missing=0
+
+          require_worker_secrets() {
+            local config="$1"
+            shift
+            local output
+            output="$(npx wrangler secret list -c "$config")" || return 1
+
+            for name in "$@"; do
+              if grep -Eq "\"name\"[[:space:]]*:[[:space:]]*\"${name}\"" <<<"$output"; then
+                echo "Found Cloudflare runtime secret: $name"
+              else
+                echo "::error::Missing Cloudflare runtime secret: $name"
+                missing=1
+              fi
+            done
+          }
+
+          require_worker_secrets wrangler.llm.jsonc \
+            LLM_PRIMARY_API_KEY \
+            LLM_FALLBACK_API_KEY
+
+          require_worker_secrets wrangler.api.deploy.jsonc \
+            R2_ACCESS_KEY_ID \
+            R2_SECRET_ACCESS_KEY \
+            DEVICE_AUTH_PEPPER \
+            GITHUB_DESTINATION_TOKEN
+
+          exit "$missing"
 
       - name: Show deployed versions
         shell: bash
         run: |
           set -euo pipefail
-          npx --yes wrangler@${WRANGLER_VERSION} deployments list -c wrangler.llm.jsonc
-          npx --yes wrangler@${WRANGLER_VERSION} deployments list -c wrangler.api.deploy.jsonc
+          npx wrangler deployments list -c wrangler.llm.jsonc
+          npx wrangler deployments list -c wrangler.api.deploy.jsonc
