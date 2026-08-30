@@ -9,6 +9,8 @@
     "types": "wrangler types worker-configuration.d.ts -c wrangler.api.jsonc",
     "typecheck": "npm run types && tsc -p tsconfig.json",
     "test": "tsx --test tests/stt.test.ts tests/mob019.workflow.test.ts tests/mob020.llm.test.ts tests/mob020.organize.test.ts tests/mob022.destination.test.ts tests/mob022.delivery.test.ts",
+    "dry-run:api": "wrangler deploy --dry-run -c wrangler.api.jsonc",
+    "dry-run:llm": "wrangler deploy --dry-run -c wrangler.llm.jsonc",
     "check": "npm run typecheck && npm test"
   },
   "dependencies": {
