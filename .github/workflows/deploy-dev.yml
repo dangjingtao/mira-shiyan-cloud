@@ -22,6 +22,123 @@ env:
   WRANGLER_VERSION: '4.79.0'
 
 jobs:
+  preflight:
+    name: Preflight Shiyan credentials and Cloudflare resources
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: shiyan-dev
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SHIYAN_D1_DATABASE_ID: ${{ vars.SHIYAN_D1_DATABASE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate GitHub deployment inputs
+        id: github-inputs
+        shell: bash
+        run: |
+          set -uo pipefail
+          missing=0
+
+          require_value() {
+            local kind="$1"
+            local name="$2"
+            local value="$3"
+            if [ -z "$value" ]; then
+              echo "::error::Missing ${kind}: ${name}"
+              missing=1
+            else
+              echo "Found ${kind}: ${name}"
+            fi
+          }
+
+          require_value 'GitHub secret' 'CLOUDFLARE_API_TOKEN' "${CLOUDFLARE_API_TOKEN:-}"
+          require_value 'GitHub secret' 'CLOUDFLARE_ACCOUNT_ID' "${CLOUDFLARE_ACCOUNT_ID:-}"
+          require_value 'GitHub repository/environment variable' 'SHIYAN_D1_DATABASE_ID' "${SHIYAN_D1_DATABASE_ID:-}"
+
+          if [ "$missing" -ne 0 ]; then
+            echo 'Cloudflare-side secret/resource validation cannot run until the deployment inputs above exist.'
+            exit 1
+          fi
+
+      - name: Build effective API Wrangler config for preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp wrangler.api.jsonc wrangler.api.preflight.jsonc
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = 'wrangler.api.preflight.jsonc';
+          let text = fs.readFileSync(path, 'utf8');
+
+          if (!text.includes('REPLACE_WITH_D1_DATABASE_ID')) {
+            throw new Error('wrangler.api.jsonc no longer contains the expected D1 placeholder; update workflow intentionally');
+          }
+
+          text = text.replace('REPLACE_WITH_D1_DATABASE_ID', process.env.SHIYAN_D1_DATABASE_ID);
+
+          if (!text.includes('"R2_ACCOUNT_ID"')) {
+            text = text.replace(
+              '"R2_BUCKET_NAME": "mira-shiyan-audio",',
+              `"R2_BUCKET_NAME": "mira-shiyan-audio",\n    "R2_ACCOUNT_ID": "${process.env.CLOUDFLARE_ACCOUNT_ID}",`,
+            );
+          }
+
+          fs.writeFileSync(path, text);
+          NODE
+
+      - name: Verify Cloudflare runtime secrets
+        shell: bash
+        run: |
+          set -uo pipefail
+          missing=0
+
+          check_worker_secrets() {
+            local config="$1"
+            shift
+            local output
+
+            if ! output="$(npx --yes wrangler@${WRANGLER_VERSION} secret list -c "$config" 2>&1)"; then
+              echo "::error::Unable to query Cloudflare secrets for $config"
+              echo "$output"
+              missing=1
+              return
+            fi
+
+            for name in "$@"; do
+              if grep -Eq "\"name\"[[:space:]]*:[[:space:]]*\"${name}\"" <<<"$output"; then
+                echo "Found Cloudflare runtime secret: $name"
+              else
+                echo "::error::Missing Cloudflare runtime secret: $name"
+                missing=1
+              fi
+            done
+          }
+
+          check_worker_secrets wrangler.llm.jsonc \
+            LLM_PRIMARY_API_KEY \
+            LLM_FALLBACK_API_KEY
+
+          check_worker_secrets wrangler.api.preflight.jsonc \
+            R2_ACCESS_KEY_ID \
+            R2_SECRET_ACCESS_KEY \
+            DEVICE_AUTH_PEPPER \
+            GITHUB_DESTINATION_TOKEN
+
+          exit "$missing"
+
+      - name: Verify Cloudflare D1 database is reachable
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@${WRANGLER_VERSION} d1 info mira-shiyan -c wrangler.api.preflight.jsonc >/dev/null
+          echo 'Cloudflare D1 reachable: mira-shiyan'
+
   validate:
     name: Validate Shiyan cloud contracts
     runs-on: ubuntu-latest
@@ -73,7 +190,7 @@ jobs:
 
   deploy:
     name: Deploy dev to Cloudflare
-    needs: validate
+    needs: [preflight, validate]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: shiyan-dev
@@ -87,14 +204,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: Validate deploy configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "${CLOUDFLARE_API_TOKEN:-}" || { echo 'Missing GitHub secret: CLOUDFLARE_API_TOKEN'; exit 1; }
-          test -n "${CLOUDFLARE_ACCOUNT_ID:-}" || { echo 'Missing GitHub secret: CLOUDFLARE_ACCOUNT_ID'; exit 1; }
-          test -n "${SHIYAN_D1_DATABASE_ID:-}" || { echo 'Missing GitHub repository variable: SHIYAN_D1_DATABASE_ID'; exit 1; }
 
       - name: Build effective API Wrangler config
         shell: bash
@@ -110,10 +219,7 @@ jobs:
             throw new Error('wrangler.api.jsonc no longer contains the expected D1 placeholder; update deploy workflow intentionally');
           }
 
-          text = text.replace(
-            'REPLACE_WITH_D1_DATABASE_ID',
-            process.env.SHIYAN_D1_DATABASE_ID,
-          );
+          text = text.replace('REPLACE_WITH_D1_DATABASE_ID', process.env.SHIYAN_D1_DATABASE_ID);
 
           if (!text.includes('"R2_ACCOUNT_ID"')) {
             text = text.replace(
@@ -125,41 +231,6 @@ jobs:
           fs.writeFileSync(path, text);
           NODE
 
-      - name: Check existing Cloudflare runtime secrets
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          check_worker_secrets() {
-            local config="$1"
-            shift
-            local output
-
-            if ! output="$(npx --yes wrangler@${WRANGLER_VERSION} secret list -c "$config" 2>&1)"; then
-              echo "::warning::Could not list secrets for $config before deploy. The Worker may not exist yet; required secrets will be checked again after deploy."
-              return 0
-            fi
-
-            local missing=0
-            for name in "$@"; do
-              if ! grep -Eq "\"name\"[[:space:]]*:[[:space:]]*\"${name}\"" <<<"$output"; then
-                echo "::error::Missing Cloudflare runtime secret for $config: $name"
-                missing=1
-              fi
-            done
-            return "$missing"
-          }
-
-          check_worker_secrets wrangler.llm.jsonc \
-            LLM_PRIMARY_API_KEY \
-            LLM_FALLBACK_API_KEY
-
-          check_worker_secrets wrangler.api.deploy.jsonc \
-            R2_ACCESS_KEY_ID \
-            R2_SECRET_ACCESS_KEY \
-            DEVICE_AUTH_PEPPER \
-            GITHUB_DESTINATION_TOKEN
-
       - name: Deploy private LLM Worker first
         run: npx --yes wrangler@${WRANGLER_VERSION} deploy -c wrangler.llm.jsonc
 
@@ -168,37 +239,6 @@ jobs:
 
       - name: Deploy public API Worker and Workflow
         run: npx --yes wrangler@${WRANGLER_VERSION} deploy -c wrangler.api.deploy.jsonc
-
-      - name: Verify required Cloudflare runtime secrets after deploy
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          require_worker_secrets() {
-            local config="$1"
-            shift
-            local output
-            output="$(npx --yes wrangler@${WRANGLER_VERSION} secret list -c "$config")"
-
-            local missing=0
-            for name in "$@"; do
-              if ! grep -Eq "\"name\"[[:space:]]*:[[:space:]]*\"${name}\"" <<<"$output"; then
-                echo "::error::Missing Cloudflare runtime secret for $config: $name"
-                missing=1
-              fi
-            done
-            test "$missing" -eq 0
-          }
-
-          require_worker_secrets wrangler.llm.jsonc \
-            LLM_PRIMARY_API_KEY \
-            LLM_FALLBACK_API_KEY
-
-          require_worker_secrets wrangler.api.deploy.jsonc \
-            R2_ACCESS_KEY_ID \
-            R2_SECRET_ACCESS_KEY \
-            DEVICE_AUTH_PEPPER \
-            GITHUB_DESTINATION_TOKEN
 
       - name: Show deployed versions
         shell: bash
