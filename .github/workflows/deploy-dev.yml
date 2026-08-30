@@ -7,6 +7,7 @@ on:
     paths:
       - 'src/**'
       - 'migrations/**'
+      - 'tests/**'
       - 'package.json'
       - 'package-lock.json'
       - 'wrangler.api.jsonc'
