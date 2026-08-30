@@ -1,3 +1,5 @@
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+import { generateText } from 'ai';
 import type { LlmFailure, LlmUsage } from './llm';
 
 export type FetchLike = (
@@ -35,26 +37,89 @@ export type LlmCallResult =
     }
   | { ok: false; error: LlmFailure };
 
-type ChatCompletionResponse = {
-  id?: string;
-  choices?: Array<{ message?: { content?: unknown } }>;
-  usage?: {
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    total_tokens?: number;
-  };
+type ErrorLike = {
+  name?: unknown;
+  statusCode?: unknown;
+  cause?: unknown;
+};
+
+const errorChain = (error: unknown): unknown[] => {
+  const chain: unknown[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+
+  while (current && !seen.has(current)) {
+    chain.push(current);
+    seen.add(current);
+    if (typeof current !== 'object') break;
+    current = (current as ErrorLike).cause;
+  }
+
+  return chain;
+};
+
+const errorName = (error: unknown): string => {
+  if (!error || typeof error !== 'object') return '';
+  const name = (error as ErrorLike).name;
+  return typeof name === 'string' ? name : '';
+};
+
+const statusCodeFrom = (error: unknown): number | null => {
+  for (const item of errorChain(error)) {
+    if (!item || typeof item !== 'object') continue;
+    const statusCode = (item as ErrorLike).statusCode;
+    if (typeof statusCode === 'number') return statusCode;
+  }
+  return null;
 };
 
 const isAbort = (error: unknown): boolean =>
-  error instanceof DOMException && error.name === 'AbortError';
+  errorChain(error).some((item) => {
+    if (item instanceof DOMException && item.name === 'AbortError') return true;
+    return errorName(item) === 'AbortError';
+  });
+
+const isInvalidProviderPayload = (error: unknown): boolean =>
+  errorChain(error).some((item) => {
+    const name = errorName(item);
+    return (
+      name.includes('JSONParseError') ||
+      name.includes('TypeValidationError') ||
+      name.includes('NoContentGeneratedError')
+    );
+  });
+
+const toSdkFetch = (fetchLike: FetchLike): typeof fetch =>
+  async (input, init) => {
+    const url =
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+
+    const headers = Object.fromEntries(new Headers(init?.headers).entries());
+    let body: string | undefined;
+    if (typeof init?.body === 'string') {
+      body = init.body;
+    } else if (init?.body != null) {
+      body = await new Response(init.body).text();
+    }
+
+    return fetchLike(url, {
+      ...(init?.method ? { method: init.method } : {}),
+      headers,
+      ...(body !== undefined ? { body } : {}),
+      ...(init?.signal ? { signal: init.signal } : {}),
+    });
+  };
 
 /**
- * One adapter for every OpenAI-compatible chat completions provider
- * (DeepSeek / Moonshot / Volcano / ...). Provider identity, endpoint and model
- * come from configuration; only the API key is a secret.
+ * OpenAI-compatible chat adapter backed by the Vercel AI SDK.
  *
- * Normalized failures never embed the raw upstream body, so provider details
- * or keys cannot leak to callers.
+ * The SDK owns the wire protocol, request serialization and provider response
+ * decoding. Shiyan still owns business validation, normalized failure semantics
+ * and primary -> fallback routing in ShiyanLlmGateway.
  */
 export class OpenAiCompatibleChatProvider {
   constructor(
@@ -67,103 +132,107 @@ export class OpenAiCompatibleChatProvider {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
 
-    let response: Response;
+    const provider = createOpenAICompatible({
+      name: this.config.provider,
+      baseURL: this.config.baseUrl,
+      apiKey: this.config.apiKey,
+      fetch: toSdkFetch(this.fetchLike),
+      // MOB-020 expects a JSON object. Keep that wire-level hint here while
+      // retaining Shiyan's own parser/schema validator as the source of truth.
+      transformRequestBody: (body) => ({
+        ...body,
+        response_format: { type: 'json_object' },
+      }),
+    });
+
     try {
-      response = await this.fetchLike(
-        `${this.config.baseUrl.replace(/\/+$/u, '')}/chat/completions`,
-        {
-          method: 'POST',
-          headers: {
-            authorization: `Bearer ${this.config.apiKey}`,
-            'content-type': 'application/json',
+      const result = await generateText({
+        model: provider.chatModel(this.config.model),
+        messages: [
+          { role: 'system', content: input.systemPrompt },
+          { role: 'user', content: input.userPrompt },
+        ],
+        temperature: 0.2,
+        // ShiyanLlmGateway owns failover. Disable SDK retries so one provider
+        // attempt cannot silently multiply requests before fallback begins.
+        maxRetries: 0,
+        abortSignal: controller.signal,
+      });
+
+      const content = result.text;
+      if (!content.trim()) {
+        return {
+          ok: false,
+          error: {
+            kind: 'terminal',
+            code: 'invalid_response',
+            message: `${this.config.provider} returned no completion content`,
           },
-          body: JSON.stringify({
-            model: this.config.model,
-            messages: [
-              { role: 'system', content: input.systemPrompt },
-              { role: 'user', content: input.userPrompt },
-            ],
-            temperature: 0.2,
-            response_format: { type: 'json_object' },
-          }),
-          signal: controller.signal,
-        },
-      );
+        };
+      }
+
+      const usage = result.usage;
+      const normalizedUsage: LlmUsage = {
+        ...(typeof usage.inputTokens === 'number'
+          ? { promptTokens: usage.inputTokens }
+          : {}),
+        ...(typeof usage.outputTokens === 'number'
+          ? { completionTokens: usage.outputTokens }
+          : {}),
+        ...(typeof usage.totalTokens === 'number'
+          ? { totalTokens: usage.totalTokens }
+          : {}),
+      };
+
+      return {
+        ok: true,
+        content,
+        provider: this.config.provider,
+        model: this.config.model,
+        latencyMs: Date.now() - startedAt,
+        ...(Object.keys(normalizedUsage).length > 0
+          ? { usage: normalizedUsage }
+          : {}),
+        ...(result.response?.id
+          ? { providerRequestId: result.response.id }
+          : {}),
+      };
     } catch (error) {
+      const status = statusCodeFrom(error);
+      if (status !== null) {
+        return { ok: false, error: this.httpFailure(status) };
+      }
+      if (isAbort(error)) {
+        return {
+          ok: false,
+          error: {
+            kind: 'retryable',
+            code: 'timeout',
+            message: `${this.config.provider} request timed out after ${this.config.timeoutMs}ms`,
+          },
+        };
+      }
+      if (isInvalidProviderPayload(error)) {
+        return {
+          ok: false,
+          error: {
+            kind: 'terminal',
+            code: 'invalid_response',
+            message: `${this.config.provider} returned an invalid OpenAI-compatible response`,
+          },
+        };
+      }
+      return {
+        ok: false,
+        error: {
+          kind: 'retryable',
+          code: 'provider_error',
+          message: `${this.config.provider} request failed before a valid response arrived`,
+        },
+      };
+    } finally {
       clearTimeout(timer);
-      return {
-        ok: false,
-        error: isAbort(error)
-          ? {
-              kind: 'retryable',
-              code: 'timeout',
-              message: `${this.config.provider} request timed out after ${this.config.timeoutMs}ms`,
-            }
-          : {
-              kind: 'retryable',
-              code: 'provider_error',
-              message: `${this.config.provider} request failed before a response arrived`,
-            },
-      };
     }
-    clearTimeout(timer);
-
-    const latencyMs = Date.now() - startedAt;
-
-    if (!response.ok) {
-      return { ok: false, error: this.httpFailure(response.status) };
-    }
-
-    let payload: ChatCompletionResponse;
-    try {
-      payload = (await response.json()) as ChatCompletionResponse;
-    } catch {
-      return {
-        ok: false,
-        error: {
-          kind: 'terminal',
-          code: 'invalid_response',
-          message: `${this.config.provider} returned HTTP 200 with a non-JSON body`,
-        },
-      };
-    }
-
-    const content = payload.choices?.[0]?.message?.content;
-    if (typeof content !== 'string' || !content.trim()) {
-      return {
-        ok: false,
-        error: {
-          kind: 'terminal',
-          code: 'invalid_response',
-          message: `${this.config.provider} returned no completion content`,
-        },
-      };
-    }
-
-    const usage = payload.usage;
-    return {
-      ok: true,
-      content,
-      provider: this.config.provider,
-      model: this.config.model,
-      latencyMs,
-      ...(usage
-        ? {
-            usage: {
-              ...(typeof usage.prompt_tokens === 'number'
-                ? { promptTokens: usage.prompt_tokens }
-                : {}),
-              ...(typeof usage.completion_tokens === 'number'
-                ? { completionTokens: usage.completion_tokens }
-                : {}),
-              ...(typeof usage.total_tokens === 'number'
-                ? { totalTokens: usage.total_tokens }
-                : {}),
-            },
-          }
-        : {}),
-      ...(payload.id ? { providerRequestId: payload.id } : {}),
-    };
   }
 
   private httpFailure(status: number): LlmFailure {
@@ -189,8 +258,6 @@ export class OpenAiCompatibleChatProvider {
         message: `${provider} rejected the configured credential (HTTP ${status})`,
       };
     }
-    // 400/404/422 and other 4xx are input or contract problems: retrying the
-    // identical request or failing over cannot fix them.
     return {
       kind: 'terminal',
       code: 'invalid_request',
