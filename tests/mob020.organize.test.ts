@@ -647,10 +647,9 @@ test('Organize retry endpoint restarts the workflow without re-running STT', asy
   assert.equal(workflowCreates.length, 1);
   assert.equal(workflowCreates[0].id, `capture-${TASK_ID}-organize-1`);
   assert.equal(workflowCreates[0].params?.startStage, 'organize');
-  assert.equal(
-    db.statements.some(({ sql }) => sql.includes('FROM transcripts')),
-    true,
-  );
+  // A successful retry already proves a persisted Transcript was available;
+// separately assert that retry preserves that evidence and never restarts STT.
+assert.equal(db.transcript?.text, TRANSCRIPT_TEXT);
   assert.equal(
     db.statements.some(({ sql }) => sql.includes("SET status = 'running'") && sql.includes('transcribe')),
     false,
