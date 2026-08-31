@@ -1,0 +1,49 @@
+name: Inspect Shiyan LLM latency evidence
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/inspect-llm-latency.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: shiyan-dev
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SHIYAN_D1_DATABASE_ID: ${{ vars.SHIYAN_D1_DATABASE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build effective D1 config
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp wrangler.api.jsonc wrangler.inspect.jsonc
+          node <<'NODE'
+          const fs = require('node:fs');
+          const p = 'wrangler.inspect.jsonc';
+          let s = fs.readFileSync(p, 'utf8');
+          s = s.replace('REPLACE_WITH_D1_DATABASE_ID', process.env.SHIYAN_D1_DATABASE_ID);
+          fs.writeFileSync(p, s);
+          NODE
+      - name: Inspect recent organize timings without content
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4.79.0 d1 execute mira-shiyan --remote -c wrangler.inspect.jsonc --command "SELECT cs.status AS organize_status, cs.retry_count, cs.error_code, CAST((julianday(COALESCE(cs.finished_at, cs.updated_at)) - julianday(cs.started_at))*86400000 AS INTEGER) AS stage_ms, length(t.text) AS transcript_chars, t.duration_ms AS audio_duration_ms, d.provider, d.model, d.latency_ms, d.prompt_tokens, d.completion_tokens, d.total_tokens, d.fallback_used, ct.created_at FROM capture_tasks ct JOIN transcripts t ON t.task_id = ct.id LEFT JOIN capture_stages cs ON cs.task_id = ct.id AND cs.stage = 'organize' LEFT JOIN drafts d ON d.task_id = ct.id AND d.kind = 'ai' AND d.version = 1 ORDER BY ct.created_at DESC LIMIT 6;"
+      - name: Inspect non-secret LLM Worker variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/mira-shiyan-llm/settings" \
+            | jq '{success, vars: [(.result.bindings // [])[] | select(.type == "plain_text") | select(.name == "LLM_PRIMARY_PROVIDER" or .name == "LLM_PRIMARY_BASE_URL" or .name == "LLM_PRIMARY_MODEL" or .name == "LLM_FALLBACK_PROVIDER" or .name == "LLM_FALLBACK_BASE_URL" or .name == "LLM_FALLBACK_MODEL" or .name == "LLM_TIMEOUT_MS" or .name == "LLM_MAX_TRANSCRIPT_CHARS") | {name, text}]}'
