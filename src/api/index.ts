@@ -8,6 +8,7 @@ import {
   type Mob019WorkflowStep,
 } from './mob019';
 import { handleMob020Request, runMob020Organize } from './mob020';
+import { handleMob022Request } from './mob022';
 import { createPresignedR2PutUrl } from '../shared/r2Presign';
 import type { ShiyanLlmBinding } from '../shared/llm';
 import type {
@@ -78,6 +79,11 @@ interface Env {
   R2_BUCKET_NAME: string;
   UPLOAD_TTL_SECONDS: string;
   DEVICE_AUTH_PEPPER: string;
+  GITHUB_DESTINATION_TOKEN: string;
+  GITHUB_DESTINATION_OWNER?: string;
+  GITHUB_DESTINATION_REPOSITORY?: string;
+  GITHUB_DESTINATION_BRANCH?: string;
+  GITHUB_DESTINATION_ROOT?: string;
 }
 
 interface DeviceRow {
@@ -656,6 +662,9 @@ export default {
 
     const mob020Response = await handleMob020Request(request, env, device, requestId);
     if (mob020Response) return mob020Response;
+
+    const mob022Response = await handleMob022Request(request, env, device, requestId);
+    if (mob022Response) return mob022Response;
 
     return errorResponse(requestId, 404, 'route_not_found', 'Route not found');
   },

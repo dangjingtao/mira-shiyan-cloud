@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { executeDestinationDelivery, type Mob022Env } from '../src/api/mob022';
+import {
+  executeDestinationDelivery,
+  handleMob022Request,
+  type Mob022Env,
+  type Mob022GithubEnv,
+} from '../src/api/mob022';
 import type {
   ConfirmedFinalDraftSnapshot,
   DestinationAdapter,
@@ -61,6 +66,8 @@ class FakeDb {
   readonly deliveries = new Map<string, DeliveryRow>();
   deliveryStage = { status: 'pending', retryable: 1, retry_count: 0, error_code: null as string | null };
   currentStage = 'ready';
+  ownerDeviceId = 'device-1';
+  finalDraft: ConfirmedFinalDraftSnapshot | null = DRAFT;
 
   prepare(sql: string): FakeStatement {
     return new FakeStatement(this, sql);
@@ -72,8 +79,21 @@ class FakeDb {
   }
 
   first(sql: string, values: Array<string | number | null>): unknown {
+    if (sql.includes('FROM capture_tasks') && sql.includes('device_id = ?')) {
+      return values[0] === TASK_ID && values[1] === this.ownerDeviceId ? { id: TASK_ID } : null;
+    }
     if (sql.includes('FROM capture_tasks') && sql.includes('WHERE id = ?')) {
       return values[0] === TASK_ID ? { id: TASK_ID } : null;
+    }
+    if (sql.includes('FROM drafts') && sql.includes("kind = 'final'")) {
+      if (values[0] !== TASK_ID || !this.finalDraft) return null;
+      return {
+        id: this.finalDraft.id,
+        task_id: this.finalDraft.taskId,
+        title: this.finalDraft.title,
+        markdown: this.finalDraft.markdown,
+        confirmed_at: this.finalDraft.confirmedAt,
+      };
     }
     if (sql.includes('FROM delivery_records') && sql.includes('idempotency_key = ?')) {
       const [taskId, key] = values;
@@ -159,6 +179,11 @@ class FakeDb {
 }
 
 const envFor = (db: FakeDb): Mob022Env => ({ DB: db as unknown as Mob019D1 });
+
+const githubEnvFor = (db: FakeDb): Mob022GithubEnv => ({
+  DB: db as unknown as Mob019D1,
+  GITHUB_DESTINATION_TOKEN: 'test-token',
+});
 
 const successResult = (): DestinationResult => ({
   ok: true,
@@ -261,4 +286,71 @@ test('one idempotency key cannot be rebound to different confirmed content', asy
   assert.equal(conflict.ok, false);
   if (!conflict.ok) assert.equal(conflict.error.code, 'delivery_idempotency_conflict');
   assert.equal(calls, 1);
+});
+
+test('POST deliveries publishes the confirmed Final Draft and replays saved evidence', async () => {
+  const db = new FakeDb();
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) return new Response(null, { status: 404 });
+    return Response.json(
+      {
+        content: {
+          path: `entries/2026/08/${TASK_ID}.md`,
+          html_url: `https://github.com/dangjingtao/mira-shiyan/blob/main/entries/2026/08/${TASK_ID}.md`,
+        },
+        commit: { sha: 'commit-route-1' },
+      },
+      { status: 201 },
+    );
+  };
+
+  try {
+    const request = () =>
+      new Request(`https://api.example/v1/capture-tasks/${TASK_ID}/deliveries`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ destination: 'github', idempotencyKey: 'mobile-deliver-1' }),
+      });
+    const first = await handleMob022Request(request(), githubEnvFor(db), { id: 'device-1' }, 'req-1');
+    const replay = await handleMob022Request(request(), githubEnvFor(db), { id: 'device-1' }, 'req-2');
+    assert.equal(first?.status, 200);
+    assert.equal(replay?.status, 200);
+    assert.equal(calls, 2);
+    const body = (await replay?.json()) as { data: { record: DeliveryRow } };
+    assert.equal(body.data.record.commit_sha ?? body.data.record.commitSha, 'commit-route-1');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('POST deliveries requires a confirmed Final Draft', async () => {
+  const db = new FakeDb();
+  db.finalDraft = null;
+  const response = await handleMob022Request(
+    new Request(`https://api.example/v1/capture-tasks/${TASK_ID}/deliveries`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ destination: 'github', idempotencyKey: 'mobile-deliver-2' }),
+    }),
+    githubEnvFor(db),
+    { id: 'device-1' },
+    'req-3',
+  );
+  assert.equal(response?.status, 409);
+  assert.equal(((await response?.json()) as { error: { code: string } }).error.code, 'final_draft_not_ready');
+});
+
+test('delivery routes conceal tasks owned by another device', async () => {
+  const db = new FakeDb();
+  const response = await handleMob022Request(
+    new Request(`https://api.example/v1/capture-tasks/${TASK_ID}/deliveries`),
+    githubEnvFor(db),
+    { id: 'device-2' },
+    'req-4',
+  );
+  assert.equal(response?.status, 404);
+  assert.equal(((await response?.json()) as { error: { code: string } }).error.code, 'task_not_found');
 });

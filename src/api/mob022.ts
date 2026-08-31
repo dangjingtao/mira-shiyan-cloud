@@ -20,6 +20,14 @@ export interface Mob022GithubEnv extends Mob022Env {
   GITHUB_DESTINATION_ROOT?: string;
 }
 
+type ConfirmedFinalDraftRow = {
+  id: string;
+  task_id: string;
+  title: string | null;
+  markdown: string;
+  confirmed_at: string;
+};
+
 type DeliveryRow = {
   id: string;
   task_id: string;
@@ -84,6 +92,39 @@ const sha256Hex = async (value: string): Promise<string> => {
     .map((byte) => byte.toString(16).padStart(2, '0'))
     .join('');
 };
+
+const safeJson = async (request: Request): Promise<Record<string, unknown> | null> => {
+  try {
+    const value = await request.json();
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+async function readConfirmedFinalDraft(
+  env: Mob022Env,
+  taskId: string,
+): Promise<ConfirmedFinalDraftSnapshot | null> {
+  const row = await env.DB.prepare(
+    `SELECT id, task_id, title, markdown, confirmed_at
+     FROM drafts
+     WHERE task_id = ? AND kind = 'final' AND confirmed_at IS NOT NULL
+     ORDER BY version DESC LIMIT 1`,
+  )
+    .bind(taskId)
+    .first<ConfirmedFinalDraftRow>();
+  if (!row || !row.title?.trim() || !row.markdown.trim()) return null;
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    title: row.title,
+    markdown: row.markdown,
+    confirmedAt: row.confirmed_at,
+  };
+}
 
 const toView = (row: DeliveryRow): DeliveryRecordView => ({
   id: row.id,
@@ -436,14 +477,14 @@ export async function deliverConfirmedFinalDraftToGithub(
 
 export async function handleMob022Request(
   request: Request,
-  env: Mob022Env,
+  env: Mob022GithubEnv,
   device: { id: string },
   requestId: string,
 ): Promise<Response | null> {
   const url = new URL(request.url);
   const match = /^\/v1\/capture-tasks\/([^/]+)\/deliveries$/.exec(url.pathname);
   if (!match) return null;
-  if (request.method !== 'GET') {
+  if (request.method !== 'GET' && request.method !== 'POST') {
     return errorResponse(requestId, 405, 'method_not_allowed', 'Method not allowed');
   }
   const taskId = parseTaskId(match[1]);
@@ -453,6 +494,58 @@ export async function handleMob022Request(
   if (!(await taskOwnedByDevice(env, taskId, device.id))) {
     return errorResponse(requestId, 404, 'task_not_found', 'CaptureTask not found');
   }
+
+  if (request.method === 'POST') {
+    const body = await safeJson(request);
+    const destination = typeof body?.destination === 'string' ? body.destination.trim() : '';
+    const idempotencyKey =
+      typeof body?.idempotencyKey === 'string' ? body.idempotencyKey.trim() : '';
+    if (destination !== 'github' || !idempotencyKey || idempotencyKey.length > 128) {
+      return errorResponse(
+        requestId,
+        400,
+        'delivery_invalid_input',
+        'destination github and idempotencyKey are required',
+      );
+    }
+
+    const draft = await readConfirmedFinalDraft(env, taskId);
+    if (!draft) {
+      return errorResponse(
+        requestId,
+        409,
+        'final_draft_not_ready',
+        'A confirmed Final Draft is required before delivery',
+        false,
+        taskId,
+      );
+    }
+
+    const result = await deliverConfirmedFinalDraftToGithub(env, draft, idempotencyKey);
+    if (!result.ok) {
+      const status =
+        result.error.code === 'delivery_idempotency_conflict' ||
+        result.error.code === 'github_path_conflict'
+          ? 409
+          : result.error.kind === 'retryable'
+            ? 503
+            : 502;
+      return errorResponse(
+        requestId,
+        status,
+        result.error.code,
+        result.error.message,
+        result.error.kind === 'retryable',
+        taskId,
+      );
+    }
+    return response({
+      ok: true,
+      data: { taskId, record: result.record, delivery: result.delivery },
+      requestId,
+    });
+  }
+
   return response({
     ok: true,
     data: { taskId, deliveries: await listDeliveries(env, taskId) },

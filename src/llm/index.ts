@@ -14,6 +14,13 @@ export type { AdjustRequest, LlmOutcome, OrganizeRequest } from '../shared/llm';
  *   cross the binding.
  */
 export class ShiyanLlmWorker extends WorkerEntrypoint<LlmEnvLike> {
+  async fetch(): Promise<Response> {
+    return Response.json(
+      { ok: false, error: { code: 'route_not_found', message: 'Route not found' } },
+      { status: 404 },
+    );
+  }
+
   private gateway(): ShiyanLlmGateway {
     return new ShiyanLlmGateway(resolveLlmSlots(this.env));
   }
