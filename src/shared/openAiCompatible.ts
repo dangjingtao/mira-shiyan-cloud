@@ -151,6 +151,10 @@ export class OpenAiCompatibleChatProvider {
         system: input.systemPrompt,
         prompt: input.userPrompt,
         temperature: 0.2,
+        // Organize/adjust responses are small structured JSON. Bound output so
+        // a reasoning-heavy or misrouted provider cannot burn thousands of
+        // completion tokens before the request timeout.
+        maxOutputTokens: 1200,
         // ShiyanLlmGateway owns failover. Disable SDK retries so one provider
         // attempt cannot silently multiply requests before fallback begins.
         maxRetries: 0,
