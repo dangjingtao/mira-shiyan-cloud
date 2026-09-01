@@ -1,0 +1,64 @@
+name: Fix Shiyan GitHub delivery runtime
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/fix-github-delivery-runtime.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Patch Cloudflare fetch invocation and regression test
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+
+          p = Path('src/shared/githubDestination.ts')
+          s = p.read_text()
+          needle = """  private contentUrl(path: string): string {\n"""
+          helper = """  private fetchGithub(...args: Parameters<GithubFetch>): ReturnType<GithubFetch> {\n    // Cloudflare Workers' native fetch must be called without rebinding `this`.\n    // Calling it as `this.fetchImpl(...)` throws an Illegal invocation TypeError.\n    const fetchImpl = this.fetchImpl;\n    return fetchImpl(...args);\n  }\n\n"""
+          if helper not in s:
+              if needle not in s:
+                  raise SystemExit('contentUrl insertion point not found')
+              s = s.replace(needle, helper + needle, 1)
+          s = s.replace('await this.fetchImpl(url, { headers: this.headers() })', 'await this.fetchGithub(url, { headers: this.headers() })')
+          s = s.replace('await this.fetchImpl(`${url}?ref=${encodeURIComponent(this.branch)}`, {', 'await this.fetchGithub(`${url}?ref=${encodeURIComponent(this.branch)}`, {')
+          s = s.replace('await this.fetchImpl(url, {\n        method: \'PUT\'', 'await this.fetchGithub(url, {\n        method: \'PUT\'')
+          p.write_text(s)
+
+          t = Path('tests/mob022.destination.test.ts')
+          ts = t.read_text()
+          marker = """test('GitHub destination creates one deterministic Markdown file and returns canonical evidence', async () => {\n"""
+          regression = """test('Cloudflare-compatible fetch is invoked detached from the adapter instance', async () => {\n  const calls: Array<{ url: string; init?: RequestInit }> = [];\n  const strictFetch = function (\n    this: unknown,\n    input: RequestInfo | URL,\n    init?: RequestInit,\n  ): Promise<Response> {\n    assert.equal(this, undefined);\n    calls.push({ url: String(input), init });\n    return Promise.resolve(new Response(null, { status: 503 }));\n  } as typeof fetch;\n  const adapter = new GithubDestinationAdapter({ token: 'secret-token' }, strictFetch);\n\n  const result = await adapter.deliver(INPUT);\n\n  assert.equal(result.ok, false);\n  if (!result.ok) assert.equal(result.error.code, 'github_unavailable');\n  assert.equal(calls.length, 1);\n});\n\n"""
+          if regression not in ts:
+              if marker not in ts:
+                  raise SystemExit('test insertion point not found')
+              ts = ts.replace(marker, regression + marker, 1)
+          t.write_text(ts)
+          PY
+      - name: Validate
+        run: |
+          npm install --ignore-scripts --no-audit --no-fund
+          npx tsc -p tsconfig.json
+          npx tsx --test tests/mob022.destination.test.ts tests/mob022.delivery.test.ts
+      - name: Commit fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/shared/githubDestination.ts tests/mob022.destination.test.ts
+          git commit -m 'fix: detach GitHub fetch in Cloudflare runtime'
+          git push origin HEAD:dev
