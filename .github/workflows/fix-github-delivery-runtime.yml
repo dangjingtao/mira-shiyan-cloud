@@ -51,6 +51,7 @@ jobs:
       - name: Validate
         run: |
           npm install --ignore-scripts --no-audit --no-fund
+          npx wrangler types worker-configuration.d.ts -c wrangler.api.jsonc
           npx tsc -p tsconfig.json
           npx tsx --test tests/mob022.destination.test.ts tests/mob022.delivery.test.ts
       - name: Commit fix
