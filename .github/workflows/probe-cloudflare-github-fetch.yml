@@ -1,0 +1,76 @@
+name: Probe Cloudflare GitHub fetch runtime
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/probe-cloudflare-github-fetch.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: shiyan-dev
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build disposable probe Worker
+        shell: bash
+        run: |
+          cat > probe.js <<'EOF'
+          export default {
+            async fetch() {
+              const url = 'https://api.github.com/repos/dangjingtao/mira-shiyan';
+              const run = async (label, fn) => {
+                try {
+                  const r = await fn();
+                  return { label, ok: true, status: r.status };
+                } catch (e) {
+                  return { label, ok: false, name: e?.name ?? null, message: e?.message ?? String(e) };
+                }
+              };
+              const headers = {
+                accept: 'application/vnd.github+json',
+                authorization: 'Bearer deliberately-invalid-probe-token',
+                'content-type': 'application/json',
+                'user-agent': 'mira-shiyan-cloud',
+                'x-github-api-version': '2022-11-28',
+              };
+              const holder = { fetchImpl: fetch };
+              const results = [];
+              results.push(await run('plain', () => fetch(url)));
+              results.push(await run('same-headers', () => fetch(url, { method: 'GET', headers })));
+              results.push(await run('property-call', () => holder.fetchImpl(url, { method: 'GET', headers })));
+              return Response.json(results);
+            },
+          };
+          EOF
+          cat > wrangler.probe.jsonc <<'EOF'
+          {
+            "$schema": "node_modules/wrangler/config-schema.json",
+            "name": "mira-shiyan-debug-github-fetch",
+            "main": "probe.js",
+            "compatibility_date": "2026-08-29",
+            "workers_dev": true
+          }
+          EOF
+      - name: Deploy and call probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4.79.0 deploy -c wrangler.probe.jsonc
+          curl -fsS 'https://mira-shiyan-debug-github-fetch.dangjingtao.workers.dev/'
+      - name: Delete disposable probe Worker
+        if: always()
+        shell: bash
+        run: |
+          curl -fsS -X DELETE \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/mira-shiyan-debug-github-fetch" \
+            | jq '{success, errors}'
