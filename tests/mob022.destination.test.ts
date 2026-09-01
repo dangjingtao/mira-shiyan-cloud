@@ -25,6 +25,26 @@ const queuedFetch = (responses: Response[], calls: Array<{ url: string; init?: R
     return response;
   };
 
+test('Cloudflare-compatible fetch is invoked detached from the adapter instance', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const strictFetch = function (
+    this: unknown,
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> {
+    assert.equal(this, undefined);
+    calls.push({ url: String(input), init });
+    return Promise.resolve(new Response(null, { status: 503 }));
+  } as typeof fetch;
+  const adapter = new GithubDestinationAdapter({ token: 'secret-token' }, strictFetch);
+
+  const result = await adapter.deliver(INPUT);
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, 'github_unavailable');
+  assert.equal(calls.length, 1);
+});
+
 test('GitHub destination creates one deterministic Markdown file and returns canonical evidence', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const adapter = new GithubDestinationAdapter(

@@ -203,6 +203,13 @@ export class GithubDestinationAdapter implements DestinationAdapter {
     };
   }
 
+  private fetchGithub(...args: Parameters<GithubFetch>): ReturnType<GithubFetch> {
+    // Cloudflare Workers' native fetch must be called without rebinding `this`.
+    // Calling it as `this.fetchImpl(...)` throws an Illegal invocation TypeError.
+    const fetchImpl = this.fetchImpl;
+    return fetchImpl(...args);
+  }
+
   private contentUrl(path: string): string {
     return `${this.apiBaseUrl}/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repository)}/contents/${encodePath(path)}`;
   }
@@ -212,7 +219,7 @@ export class GithubDestinationAdapter implements DestinationAdapter {
     const url = `${this.apiBaseUrl}/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repository)}/commits?${query.toString()}`;
     let response: Response;
     try {
-      response = await this.fetchImpl(url, { headers: this.headers() });
+      response = await this.fetchGithub(url, { headers: this.headers() });
     } catch {
       return networkFailure();
     }
@@ -235,7 +242,7 @@ export class GithubDestinationAdapter implements DestinationAdapter {
     const url = this.contentUrl(path);
     let response: Response;
     try {
-      response = await this.fetchImpl(`${url}?ref=${encodeURIComponent(this.branch)}`, {
+      response = await this.fetchGithub(`${url}?ref=${encodeURIComponent(this.branch)}`, {
         method: 'GET',
         headers: this.headers(),
       });
@@ -342,7 +349,7 @@ export class GithubDestinationAdapter implements DestinationAdapter {
     const url = this.contentUrl(path);
     let writeResponse: Response;
     try {
-      writeResponse = await this.fetchImpl(url, {
+      writeResponse = await this.fetchGithub(url, {
         method: 'PUT',
         headers: this.headers(),
         body: JSON.stringify({
