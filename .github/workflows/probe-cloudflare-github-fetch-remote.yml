@@ -1,0 +1,74 @@
+name: Probe remote Worker GitHub fetch
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/probe-cloudflare-github-fetch-remote.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: shiyan-dev
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Probe remote Worker runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > probe.js <<'EOF'
+          export default {
+            async fetch() {
+              const url = 'https://api.github.com/repos/dangjingtao/mira-shiyan';
+              const run = async (label, fn) => {
+                try {
+                  const r = await fn();
+                  return { label, ok: true, status: r.status };
+                } catch (e) {
+                  return { label, ok: false, name: e?.name ?? null, message: e?.message ?? String(e) };
+                }
+              };
+              const headers = {
+                accept: 'application/vnd.github+json',
+                authorization: 'Bearer deliberately-invalid-probe-token',
+                'content-type': 'application/json',
+                'user-agent': 'mira-shiyan-cloud',
+                'x-github-api-version': '2022-11-28',
+              };
+              const holder = { fetchImpl: fetch };
+              const results = [];
+              results.push(await run('plain', () => fetch(url)));
+              results.push(await run('same-headers', () => fetch(url, { method: 'GET', headers })));
+              results.push(await run('property-call', () => holder.fetchImpl(url, { method: 'GET', headers })));
+              return Response.json(results);
+            },
+          };
+          EOF
+          cat > wrangler.probe.jsonc <<'EOF'
+          {
+            "$schema": "node_modules/wrangler/config-schema.json",
+            "name": "mira-shiyan-debug-github-fetch-remote",
+            "main": "probe.js",
+            "compatibility_date": "2026-08-29"
+          }
+          EOF
+          npx --yes wrangler@4.79.0 dev --remote --port 8787 -c wrangler.probe.jsonc >/tmp/wrangler-probe.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8787/; then
+              echo
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/wrangler-probe.log
+          exit 1
