@@ -1,0 +1,20 @@
+name: Dispatch dev deploy once
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/dispatch-dev-deploy-once.yml'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch canonical dev deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST repos/${{ github.repository }}/actions/workflows/deploy-dev.yml/dispatches -f ref=dev
