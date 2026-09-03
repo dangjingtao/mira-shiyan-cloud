@@ -4,6 +4,12 @@
   "main": "src/api/index.ts",
   "compatibility_date": "2026-08-29",
   "observability": { "enabled": true },
+  "routes": [
+    {
+      "pattern": "shiyan-api.tomz.io",
+      "custom_domain": true
+    }
+  ],
   "vars": {
     "R2_BUCKET_NAME": "mira-shiyan-audio",
     "UPLOAD_TTL_SECONDS": "900"
