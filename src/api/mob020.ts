@@ -1085,6 +1085,18 @@ async function saveFinalDraft(
     )
     .run();
 
+  // Confirming the Final Draft completes the capture lifecycle (issue #95 in
+  // dangjingtao/uichat-mira-mobile): without this the task stays `ready`
+  // forever, so Mobile list rows keep showing 待你确认 while the detail
+  // screen already shows the confirmed draft. AI candidate paths never write
+  // kind='final', so only this handler promotes a task to 'completed'.
+  await env.DB.prepare(
+    `UPDATE capture_tasks SET lifecycle_status = 'completed', updated_at = ?
+     WHERE id = ? AND lifecycle_status = 'ready'`,
+  )
+    .bind(now, taskId)
+    .run();
+
   const draft = await readFinalDraft(env, taskId);
   if (!draft) {
     return errorResponse(

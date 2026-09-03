@@ -394,6 +394,9 @@ class FakeDb {
       if (sql.includes("lifecycle_status = 'ready'") && task.lifecycle_status === 'active') {
         task.lifecycle_status = 'ready';
       }
+      if (sql.includes("lifecycle_status = 'completed'") && task.lifecycle_status === 'ready') {
+        task.lifecycle_status = 'completed';
+      }
       const currentStage = /current_stage = '([a-z-]+)'/u.exec(sql);
       if (currentStage) task.current_stage = currentStage[1];
     }
@@ -1196,6 +1199,7 @@ test('Final Draft save requires an AI draft and upserts a single working state',
   assert.equal(saveBody.data.draft.baseVersion, 1);
   assert.equal(saveBody.data.draft.confirmedAt.length > 0, true);
   assert.equal(saveBody.data.draft.structured?.summary, '团队对齐了灰度计划。');
+  assert.equal(db.tasks.get(TASK_ID)?.lifecycle_status, 'completed');
 
   const resave = await handleMob020Request(
     request(`/v1/capture-tasks/${TASK_ID}/final-draft`, {
@@ -1214,6 +1218,7 @@ test('Final Draft save requires an AI draft and upserts a single working state',
   assert.equal(resaveBody.data.draft.title, '周会（改）');
   assert.equal(resaveBody.data.draft.markdown.includes('第二次人工修改'), true);
   assert.equal(resaveBody.data.draft.confirmedAt.length > 0, true);
+  assert.equal(db.tasks.get(TASK_ID)?.lifecycle_status, 'completed');
 
   const finalRows = db.drafts.filter((draft) => draft.kind === 'final');
   assert.equal(finalRows.length, 1);
@@ -1250,6 +1255,7 @@ test('AI adjust after a saved Final Draft creates a candidate without overwritin
     'request-final',
   );
   assert.equal(save?.status, 200);
+  assert.equal(db.tasks.get(TASK_ID)?.lifecycle_status, 'completed');
   const finalBefore = db.drafts.find((draft) => draft.kind === 'final');
 
   const adjust = await handleMob020Request(
@@ -1274,4 +1280,7 @@ test('AI adjust after a saved Final Draft creates a candidate without overwritin
     2,
   );
   assert.equal(db.transcript?.text, TRANSCRIPT_TEXT);
+  // Adjusting after confirmation produces a candidate without regressing the
+  // completed lifecycle (issue #95).
+  assert.equal(db.tasks.get(TASK_ID)?.lifecycle_status, 'completed');
 });
