@@ -107,6 +107,7 @@ PUT  /v1/capture-tasks/{taskId}/final-draft         # 保存 / 确认人工最�
 - `kind='final'`：用户人工最终稿，单工作态（version 1，upsert）。只有用户通过 `PUT final-draft` 写入；任何 AI 路径都不写 `kind='final'`，后台不会静默覆盖人工内容。
 - Final Draft 行携带 `title / markdown / confirmed_at`，即 MOB-022 delivery 层消费的 `ConfirmedFinalDraftSnapshot`；投递不信任客户端直接提交的 Markdown。
 - Final Draft 保存要求已存在 AI Draft（`final_draft_requires_ai_draft`）；保存后再次 AI 调整只会生成新的候选 AI Draft 版本。
+- 保存 Final Draft 会把任务 lifecycle 从 `ready` 推进为 `completed`（单次确认，幂等）；migration `0006_final_draft_lifecycle_backfill.sql` 回填历史已确认但仍停留在 `ready` 的任务（issue uichat-mira-mobile#95）。
 
 ## GitHub Destination 配置
 
